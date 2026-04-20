@@ -1,0 +1,116 @@
+/* highlight.js theme — must precede @tailwind directives */
+@import 'highlight.js/styles/atom-one-dark.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html {
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    margin: 0;
+    background-color: #0f1117;
+    color: #e6edf3;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #21262d;
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #30363d;
+  }
+}
+
+@layer utilities {
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-none {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+/* prose invert tweaks for markdown in dark mode */
+.prose-invert {
+  --tw-prose-body: #e6edf3;
+  --tw-prose-headings: #e6edf3;
+  --tw-prose-code: #00dc82;
+  --tw-prose-pre-code: #e6edf3;
+  --tw-prose-pre-bg: #161b22;
+  --tw-prose-bold: #e6edf3;
+  --tw-prose-links: #58a6ff;
+  --tw-prose-quotes: #8b949e;
+  --tw-prose-hr: #21262d;
+  --tw-prose-th-borders: #21262d;
+  --tw-prose-td-borders: #21262d;
+}
+
+.prose p {
+  margin-top: 0.4em;
+  margin-bottom: 0.4em;
+}
+
+.prose ul,
+.prose ol {
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
+  padding-left: 1.2em;
+}
+
+.prose li {
+  margin-top: 0.15em;
+  margin-bottom: 0.15em;
+}
+
+.prose pre {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4 {
+  margin-top: 0.6em;
+  margin-bottom: 0.3em;
+}
+
+.prose blockquote {
+  border-left: 2px solid #21262d;
+  padding-left: 0.75em;
+  color: #8b949e;
+  font-style: normal;
+}
+
+.prose table {
+  font-size: 0.85em;
+  width: 100%;
+  border-collapse: collapse;
+}
+.prose th, .prose td {
+  border: 1px solid #21262d;
+  padding: 0.3em 0.6em;
+}
+.prose th {
+  background: #161b22;
+}

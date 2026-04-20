@@ -9,7 +9,7 @@ import { name, version } from './package.json'
 export default defineConfig({
   resolve: {
     alias: {
-      '@': `${path.resolve(__dirname, 'src')}`,
+      '@': path.resolve(__dirname, 'src'),
     },
   },
   plugins: [
@@ -19,9 +19,18 @@ export default defineConfig({
   ],
   server: {
     cors: {
-      origin: [
-        /chrome-extension:\/\//,
-      ],
+      origin: [/chrome-extension:\/\//],
+    },
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: (id: string) => {
+          if (id.includes('highlight.js')) return 'highlight'
+          if (id.includes('react-markdown') || id.includes('remark-gfm')) return 'markdown'
+          return undefined
+        },
+      },
     },
   },
 })
