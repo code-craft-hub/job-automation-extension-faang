@@ -13,6 +13,8 @@ type ElementInfo = {
 
 type HiddenInput = { name: string; id?: string; value?: string }
 
+type FillInstruction = { name?: string; id?: string; value: string }
+
 const JOB_LINK_RE =
   /\b(apply|application|job|career|position|opening|vacancy|hiring|recruit|join.?us|work.?with.?us|opportunities)\b/i
 
@@ -84,36 +86,90 @@ function qAll(sel: string): Element[] {
   return Array.from(document.querySelectorAll(sel))
 }
 
+function fillElement(el: Element, value: string) {
+  const tag = el.tagName.toLowerCase()
+  const type = el.getAttribute('type')?.toLowerCase()
+
+  if (tag === 'select') {
+    const sel = el as HTMLSelectElement
+    const option = Array.from(sel.options).find(
+      (o) =>
+        o.value.toLowerCase() === value.toLowerCase() ||
+        o.text.toLowerCase().includes(value.toLowerCase()),
+    )
+    if (option) {
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLSelectElement.prototype,
+        'value',
+      )?.set
+      setter?.call(sel, option.value)
+      sel.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+  } else if (type === 'checkbox') {
+    const cb = el as HTMLInputElement
+    const shouldCheck = ['true', '1', 'yes', 'checked', 'on'].includes(
+      value.toLowerCase(),
+    )
+    if (cb.checked !== shouldCheck) cb.click()
+  } else if (type === 'radio') {
+    const name = el.getAttribute('name')
+    if (name) {
+      try {
+        const radios = document.querySelectorAll<HTMLInputElement>(
+          `input[type="radio"][name="${CSS.escape(name)}"]`,
+        )
+        const target = Array.from(radios).find(
+          (r) => r.value.toLowerCase() === value.toLowerCase(),
+        )
+        if (target && !target.checked) target.click()
+      } catch { /* noop */ }
+    }
+  } else if (tag === 'textarea') {
+    const ta = el as HTMLTextAreaElement
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      'value',
+    )?.set
+    setter?.call(ta, value)
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+    ta.dispatchEvent(new Event('change', { bubbles: true }))
+  } else {
+    // text, email, tel, number, url, date, etc.
+    const input = el as HTMLInputElement
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      'value',
+    )?.set
+    setter?.call(input, value)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'GET_JOB_ELEMENTS') {
-    // Text inputs: covers name, email, phone, LinkedIn URL, salary, GitHub, etc.
     const TEXT_TYPES = ['text', 'email', 'tel', 'number', 'url', 'search', 'password']
     const textFields = qAll(
       [...TEXT_TYPES.map((t) => `input[type="${t}"]`), 'input:not([type])'].join(','),
     ).map((el) => info(el))
 
-    // Date/time inputs: start date, graduation date, availability
     const DATE_TYPES = ['date', 'datetime-local', 'month', 'week', 'time']
     const dateFields = qAll(DATE_TYPES.map((t) => `input[type="${t}"]`).join(',')).map(
       (el) => info(el),
     )
 
-    // File uploads: resume, CV, cover letter, portfolio, transcripts
     const fileUploads = qAll('input[type="file"]').map((el) =>
       info(el, { value: el.getAttribute('accept') ?? undefined }),
     )
 
-    // Checkboxes: agreements, EEO disclosures, newsletter opt-ins, skills lists
     const checkboxes = qAll('input[type="checkbox"]').map((el) =>
       info(el, { value: (el as HTMLInputElement).checked ? 'checked' : 'unchecked' }),
     )
 
-    // Radio buttons: yes/no questions, work authorization, gender, relocation
     const radios = qAll('input[type="radio"]').map((el) =>
       info(el, { value: (el as HTMLInputElement).value || undefined }),
     )
 
-    // Select dropdowns: country, state, education level, years of experience, notice period
     const dropdowns = qAll('select').map((el) => {
       const options = Array.from((el as HTMLSelectElement).options)
         .map((o) => o.text.trim())
@@ -121,10 +177,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return { ...info(el), options }
     })
 
-    // Textareas: cover letter, bio, additional info, address, why this company
     const textareas = qAll('textarea').map((el) => info(el))
 
-    // Buttons: apply, submit, next step, back, save draft, sign in with LinkedIn
     const BUTTON_SEL =
       'button,input[type="submit"],input[type="button"],input[type="reset"],input[type="image"]'
     const buttons = qAll(BUTTON_SEL).map((el) =>
@@ -134,7 +188,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }),
     )
 
-    // Navigation links: links to job listings, career pages, apply pages
     const navigationLinks = qAll('a[href]')
       .filter(
         (el) =>
@@ -148,12 +201,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }),
       )
 
-    // Rich text editors: Workday, Greenhouse, Lever cover letter editors
     const richTextEditors = qAll('[contenteditable="true"]')
       .filter((el) => !['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName))
       .map((el) => info(el))
 
-    // Custom ARIA components: non-native dropdowns, comboboxes, skill pickers
     const ARIA_ROLES = [
       'textbox', 'combobox', 'listbox', 'spinbutton',
       'slider', 'switch', 'searchbox',
@@ -162,7 +213,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .filter((el) => !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(el.tagName))
       .map((el) => info(el))
 
-    // Hidden inputs: form metadata, CSRF-like tokens, source tracking, referral codes
     const hiddenInputs: HiddenInput[] = qAll('input[type="hidden"]').map((el) => ({
       name: (el as HTMLInputElement).name || '',
       id: el.getAttribute('id') ?? undefined,
@@ -170,30 +220,41 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }))
 
     const categories = {
-      textFields,
-      dateFields,
-      fileUploads,
-      checkboxes,
-      radios,
-      dropdowns,
-      textareas,
-      buttons,
-      navigationLinks,
-      richTextEditors,
-      customComponents,
-      hiddenInputs,
+      textFields, dateFields, fileUploads, checkboxes, radios,
+      dropdowns, textareas, buttons, navigationLinks,
+      richTextEditors, customComponents, hiddenInputs,
     }
 
     const totals = Object.fromEntries(
       Object.entries(categories).map(([k, v]) => [k, v.length]),
     )
 
-    sendResponse({
-      url: window.location.href,
-      title: document.title,
-      categories,
-      totals,
-    })
+    sendResponse({ url: window.location.href, title: document.title, categories, totals })
   }
+
+  if (message.type === 'FILL_FORM') {
+    const fills = (message.fills ?? []) as FillInstruction[]
+    let filled = 0
+
+    for (const instr of fills) {
+      let el: Element | null = null
+
+      if (instr.name) {
+        try {
+          el = document.querySelector(`[name="${CSS.escape(instr.name)}"]`)
+        } catch { /* noop */ }
+      }
+      if (!el && instr.id) {
+        el = document.getElementById(instr.id)
+      }
+
+      if (!el) continue
+      fillElement(el, instr.value)
+      filled++
+    }
+
+    sendResponse({ filled })
+  }
+
   return true
 })
