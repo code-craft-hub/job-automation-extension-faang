@@ -1,22 +1,36 @@
-import crxLogo from '@/assets/crx.svg'
-import reactLogo from '@/assets/react.svg'
-import viteLogo from '@/assets/vite.svg'
-import HelloWorld from '@/components/HelloWorld'
-import './App.css'
+import { useEffect, useState } from "react";
+
+type ElementData = {
+  total: number;
+  tags: [string, number][];
+};
 
 export default function App() {
+  const [data, setData] = useState<ElementData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    chrome.runtime.sendMessage({ type: "GET_ELEMENTS" }, (response) => {
+      if (chrome.runtime.lastError) {
+        setError(chrome.runtime.lastError.message ?? "Unknown error");
+        return;
+      }
+      if (response?.error) {
+        setError(response.error);
+        return;
+      }
+      setData(response);
+    });
+  }, []);
+
+  if (error) return <pre>Error: {error}</pre>;
+  if (!data) return <pre>Loading...</pre>;
+
   return (
-    <div>
-      <a href="https://vite.dev" target="_blank" rel="noreferrer">
-        <img src={viteLogo} className="logo" alt="Vite logo" />
-      </a>
-      <a href="https://reactjs.org/" target="_blank" rel="noreferrer">
-        <img src={reactLogo} className="logo react" alt="React logo" />
-      </a>
-      <a href="https://crxjs.dev/vite-plugin" target="_blank" rel="noreferrer">
-        <img src={crxLogo} className="logo crx" alt="crx logo" />
-      </a>
-      <HelloWorld msg="Vite + React + CRXJS" />
-    </div>
-  )
+    <pre>
+      Total elements: {data.total}
+      {"\n\n"}
+      {data.tags.map(([tag, count]) => `${tag}: ${count}`).join("\n")}
+    </pre>
+  );
 }
