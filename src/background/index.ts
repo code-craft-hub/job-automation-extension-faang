@@ -166,4 +166,32 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     })
     return true
   }
+
+  if (type === 'OPEN_SIDE_PANEL') {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0]
+      if (!tab?.id || tab.windowId == null) { sendResponse({}); return }
+      const tabId    = tab.id
+      const windowId = tab.windowId
+      const jobUrl   = message.jobUrl as string | undefined
+
+      // Persist job data for the side panel to pick up on load
+      chrome.storage.local.set({ pendingJob: message }, () => {
+        chrome.sidePanel.open({ windowId }, () => {
+          if (chrome.runtime.lastError) {
+            console.error('[BG] sidePanel.open failed:', chrome.runtime.lastError.message)
+          }
+          if (jobUrl) {
+            watchedTabId       = tabId
+            watchedOpenerTabId = null
+            pendingNewTab      = null
+            console.log(`[BG] OPEN_SIDE_PANEL: navigating tab ${tabId} → ${jobUrl}`)
+            chrome.tabs.update(tabId, { url: jobUrl })
+          }
+          sendResponse({})
+        })
+      })
+    })
+    return true
+  }
 })

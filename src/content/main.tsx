@@ -1,5 +1,29 @@
 console.log('[CS] Content script loaded on:', window.location.href)
 
+// ── Web-page bridge ────────────────────────────────────────────────────────────
+// Marks the extension as installed so the web app can detect it via DOM attribute.
+document.documentElement.setAttribute('data-cverai-ext', 'true')
+
+window.addEventListener('cverai:ping', () => {
+  window.dispatchEvent(new CustomEvent('cverai:ready', { bubbles: false }))
+})
+
+// "Apply Now" clicked in web app → open side panel + navigate to job URL
+window.addEventListener('cverai:apply', (e: Event) => {
+  const detail = (e as CustomEvent<Record<string, unknown>>).detail
+  console.log('[CS] cverai:apply → OPEN_SIDE_PANEL', detail)
+  chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL', ...detail }, () => {
+    void chrome.runtime.lastError
+  })
+})
+
+window.addEventListener('cverai:focus-tab', (e: Event) => {
+  const detail = (e as CustomEvent<{ jobId?: string }>).detail
+  chrome.runtime.sendMessage({ type: 'FOCUS_TAB', jobId: detail.jobId }, () => {
+    void chrome.runtime.lastError
+  })
+})
+
 type ElementInfo = {
   tag: string
   type?: string

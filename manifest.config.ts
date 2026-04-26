@@ -26,10 +26,11 @@ export default defineManifest({
   host_permissions: [
     'https://generativelanguage.googleapis.com/*',
     'https://*/*',
+    'http://localhost/*',
   ],
   content_scripts: [{
     js: ['src/content/main.tsx'],
-    matches: ['https://*/*'],
+    matches: ['https://*/*', 'http://localhost/*'],
   }],
   side_panel: {
     default_path: 'src/sidepanel/index.html',

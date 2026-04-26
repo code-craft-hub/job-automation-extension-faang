@@ -341,6 +341,7 @@ export default function App() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [submitResult, setSubmitResult] = useState<SubmitResult | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+  const [jobInfo, setJobInfo] = useState<{ title: string; company: string } | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   // Auto-loop engine refs
@@ -363,16 +364,41 @@ export default function App() {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  // Load saved API key
+  // Load API key + check for a job queued by "Apply Now" in the web app
   useEffect(() => {
-    chrome.storage.local.get("geminiApiKey", (result) => {
-      if (result.geminiApiKey) {
-        setApiKey(result.geminiApiKey as string);
+    chrome.storage.local.get(["geminiApiKey", "pendingJob"], (result) => {
+      const key = result.geminiApiKey as string | undefined;
+      const job = result.pendingJob as {
+        title?: string; company?: string; jobUrl?: string;
+      } | undefined;
+
+      if (key) setApiKey(key);
+
+      if (job) {
+        chrome.storage.local.remove("pendingJob");
+        const title   = job.title   ?? "Job";
+        const company = job.company ?? "";
+        setJobInfo({ title, company });
+
+        if (key) {
+          // Auto-start: set running flag now; TAB_READY fires runCycle once the job page loads
+          isRunningRef.current   = true;
+          navCountRef.current    = 0;
+          continueCountRef.current = 0;
+          setSubmitResult(null);
+          setLogs([]);
+          setPhase("running");
+          log(`Auto Apply started for: ${title}${company ? ` @ ${company}` : ""}`);
+        } else {
+          log(`Job queued: ${title}. Enter your Gemini API key above, then click Auto Apply.`);
+        }
+      } else if (key) {
         log("API key loaded. Click Auto Apply to start.");
       } else {
         log("No API key found. Enter one above.");
       }
     });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Listen for TAB_READY from background (fires when navigated tab finishes loading)
@@ -729,6 +755,12 @@ Respond with ONLY a valid JSON array, no markdown:
 
   return (
     <div style={{ fontFamily: "monospace", fontSize: "12px", padding: "8px" }}>
+      {jobInfo && (
+        <div style={{ marginBottom: "6px", padding: "4px 6px", background: "#1e1e2e", borderRadius: "4px", borderLeft: "3px solid #6366f1" }}>
+          <div style={{ fontWeight: "bold", color: "#c4b5fd", fontSize: "11px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{jobInfo.title}</div>
+          {jobInfo.company && <div style={{ color: "#a1a1aa", fontSize: "10px" }}>{jobInfo.company}</div>}
+        </div>
+      )}
       <input
         type="password"
         placeholder="Gemini API key (saved locally)"
