@@ -258,6 +258,8 @@ export default function App() {
   const MAX_NAV = 5;
   const MAX_CONTINUE = 10;
   const runCycleRef = useRef<(() => Promise<void>) | null>(null);
+  // Fallback timer: re-runs cycle if a click doesn't cause navigation (in-page form reveal)
+  const clickFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function log(msg: string) {
     const entry = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -285,6 +287,10 @@ export default function App() {
   useEffect(() => {
     const handler = (message: unknown) => {
       if ((message as { type?: string }).type === "TAB_READY" && isRunningRef.current) {
+        if (clickFallbackTimerRef.current) {
+          clearTimeout(clickFallbackTimerRef.current);
+          clickFallbackTimerRef.current = null;
+        }
         log("← Page loaded — re-analyzing in 1s...");
         setTimeout(() => runCycleRef.current?.(), 1000);
       }
@@ -385,7 +391,14 @@ export default function App() {
         // Tell background to watch for a new tab (Apply may open in a new tab)
         chrome.runtime.sendMessage({ type: "WATCH_FOR_NEW_TAB" });
         chrome.runtime.sendMessage({ type: "CLICK_BUTTON", buttonText: decision.buttonText });
-        // TAB_READY will fire when page/new tab finishes loading
+        // TAB_READY fires if navigation/new-tab happens; fallback handles in-page form reveal
+        clickFallbackTimerRef.current = setTimeout(() => {
+          clickFallbackTimerRef.current = null;
+          if (isRunningRef.current) {
+            log("← No navigation detected — re-analyzing page...");
+            runCycleRef.current?.();
+          }
+        }, 3000);
 
       } else {
         if (decision.fills.length > 0) {
