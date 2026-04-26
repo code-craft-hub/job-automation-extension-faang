@@ -1753,6 +1753,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (btn) {
         sendResponse({ clicked: true })
         setTimeout(() => {
+          // Prevent new tab: redirect window.open to same-tab navigation
+          const origOpen = window.open.bind(window)
+          ;(window as Window & typeof globalThis).open = function (url?: string | URL): null {
+            if (url) window.location.href = typeof url === 'string' ? url : url.toString()
+            ;(window as Window & typeof globalThis).open = origOpen
+            return null
+          } as typeof window.open
+          // Strip target="_blank" from the button itself and any child anchors
+          if (btn.tagName === 'A') {
+            ;(btn as HTMLAnchorElement).removeAttribute('target')
+            ;(btn as HTMLAnchorElement).removeAttribute('rel')
+          }
+          btn.querySelectorAll<HTMLAnchorElement>('a[target]').forEach((a) => {
+            a.removeAttribute('target')
+            a.removeAttribute('rel')
+          })
           btn.click()
           setTimeout(() => {
             const DROPDOWN_SEL = [
@@ -1791,6 +1807,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                 target.click()
               }
             }
+            // Restore window.open after the click sequence is done
+            ;(window as Window & typeof globalThis).open = origOpen
           }, 600)
         }, 100)
       } else {
