@@ -237,94 +237,133 @@ function findDropdownTrigger(el: Element): HTMLElement {
   return el as HTMLElement
 }
 
-// Clicks a custom dropdown, waits for options to appear, clicks the matching option.
-async function fillCustomDropdown(el: Element, value: string): Promise<boolean> {
-  const trigger = findDropdownTrigger(el)
-  const needle = value.toLowerCase().trim()
+// Normalize text for robust matching (handles curly quotes, extra spaces, etc.)
+function normalizeText(s: string): string {
+  return s
+    .replace(/[‘’‚‛′‵]/g, "'")
+    .replace(/[“”„‟″‶]/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .trim()
+}
 
+// Click a single option element reliably.
+function clickOption(opt: HTMLElement): void {
+  opt.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }))
+  opt.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+  opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+  opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+  opt.click()
+}
+
+// Collect all visible option-like elements currently in the DOM.
+function collectVisibleOptions(): HTMLElement[] {
   const OPTION_SEL = [
     '[role="option"]',
     '[role="menuitem"]',
     'li[data-value]',
     'li[data-id]',
-    '[class*="option"][class*="item"]',
+    'li[data-key]',
+    '[class*="option"]',
     '[class*="Option"]',
-    '[class*="menu-item"]',
-    '[class*="MenuItem"]',
     'li',
   ].join(',')
+  return Array.from(document.querySelectorAll<HTMLElement>(OPTION_SEL)).filter(isVisible)
+}
 
-  // Snapshot of visible listboxes BEFORE opening (to detect portal appearance)
-  const listboxesBefore = new Set(
-    Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [class*="dropdown__menu"], [class*="select__menu"]'))
-      .filter(isVisible)
-  )
+// Open a custom dropdown and return the set of option elements that appeared.
+async function openAndGetOptions(trigger: HTMLElement): Promise<HTMLElement[]> {
+  const before = new Set(collectVisibleOptions())
 
-  // Open the dropdown with multiple event strategies
   trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
   trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }))
   trigger.click()
   trigger.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
-  trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
 
-  await delay(600)
+  await delay(650)
 
-  // Find newly appeared option containers (portal pattern)
-  const newListboxes = Array.from(
-    document.querySelectorAll<HTMLElement>('[role="listbox"], [role="menu"], [class*="dropdown__menu"], [class*="select__menu"], [class*="options-list"], [class*="OptionsList"]')
-  ).filter(el => isVisible(el) && !listboxesBefore.has(el))
+  // Prefer newly appeared options (portal pattern)
+  const after = collectVisibleOptions()
+  const newOpts = after.filter(o => !before.has(o))
+  return newOpts.length > 0 ? newOpts : after
+}
 
-  // Helper: try to pick the best matching option from a container
-  function pickOption(container: Element): boolean {
-    const opts = Array.from(container.querySelectorAll<HTMLElement>(OPTION_SEL))
-    for (const opt of opts) {
-      if (!isVisible(opt)) continue
-      const txt = opt.textContent?.trim().toLowerCase() ?? ''
-      const dataVal = (
-        opt.getAttribute('data-value') ??
-        opt.getAttribute('data-id') ??
-        opt.getAttribute('value') ?? ''
-      ).toLowerCase()
-      if (txt === needle || txt.includes(needle) || needle.includes(txt) || dataVal === needle) {
-        opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
-        opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
-        opt.click()
-        console.log(`[CS] ✓ Custom dropdown (${container === document.body ? 'global' : 'local'}): "${opt.textContent?.trim()}"`)
-        return true
-      }
-    }
+// Clicks a custom dropdown, waits for options to appear, clicks the matching option.
+async function fillCustomDropdown(el: Element, value: string): Promise<boolean> {
+  const trigger = findDropdownTrigger(el)
+  const needle = normalizeText(value)
+
+  const options = await openAndGetOptions(trigger)
+
+  if (options.length === 0) {
+    console.warn(`[CS] Custom dropdown opened but no options found for "${value}"`)
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     return false
   }
 
-  // 1. Newly appeared portal listboxes (highest confidence)
-  for (const box of newListboxes) {
-    if (pickOption(box)) { await delay(150); return true }
+  // 1. Try typing into a search box if one appeared (Workable pattern)
+  const searchInput = Array.from(document.querySelectorAll<HTMLInputElement>(
+    'input[type="search"], input[type="text"][placeholder*="earch"], input[placeholder*="earch"]'
+  )).find(isVisible)
+
+  if (searchInput) {
+    // Type the value to filter the list
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    setter?.call(searchInput, value)
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }))
+    searchInput.dispatchEvent(new Event('change', { bubbles: true }))
+    await delay(400)
+    // Re-collect options after filtering
+    const filtered = collectVisibleOptions()
+    const firstFiltered = filtered[0]
+    if (firstFiltered) {
+      clickOption(firstFiltered)
+      console.log(`[CS] ✓ Custom dropdown (search-filtered): "${firstFiltered.textContent?.trim()}"`)
+      await delay(200)
+      return true
+    }
   }
 
-  // 2. Nearby ancestor (traditional non-portal)
-  const nearAncestor =
-    trigger.closest('[role="listbox"]') ??
-    trigger.closest('[role="menu"]') ??
-    trigger.parentElement?.querySelector('[role="listbox"]') ??
-    trigger.parentElement?.parentElement?.querySelector('[role="listbox"]') ??
-    trigger.parentElement?.parentElement?.querySelector('[class*="options"]') ??
-    trigger.parentElement
-  if (nearAncestor && pickOption(nearAncestor)) { await delay(150); return true }
-
-  // 3. Global fallback — any visible option in the entire document
-  const allOpts = Array.from(document.querySelectorAll<HTMLElement>(OPTION_SEL))
-    .filter(isVisible)
-  for (const opt of allOpts) {
-    const txt = opt.textContent?.trim().toLowerCase() ?? ''
-    const dataVal = (opt.getAttribute('data-value') ?? opt.getAttribute('data-id') ?? '').toLowerCase()
-    if (txt === needle || txt.includes(needle) || needle.includes(txt) || dataVal === needle) {
-      opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
-      opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
-      opt.click()
-      console.log(`[CS] ✓ Custom dropdown (doc-wide): "${opt.textContent?.trim()}"`)
+  // 2. Try exact + partial text matching on the collected options
+  // First pass: exact match
+  for (const opt of options) {
+    const txt = normalizeText(opt.textContent ?? '')
+    const dataVal = normalizeText(
+      opt.getAttribute('data-value') ?? opt.getAttribute('data-id') ?? opt.getAttribute('value') ?? ''
+    )
+    if (txt === needle || dataVal === needle) {
+      clickOption(opt)
+      console.log(`[CS] ✓ Custom dropdown (exact): "${opt.textContent?.trim()}"`)
       await delay(150)
       return true
     }
+  }
+
+  // Second pass: partial / substring match
+  for (const opt of options) {
+    const txt = normalizeText(opt.textContent ?? '')
+    const dataVal = normalizeText(
+      opt.getAttribute('data-value') ?? opt.getAttribute('data-id') ?? opt.getAttribute('value') ?? ''
+    )
+    if (txt.includes(needle) || needle.includes(txt) || dataVal.includes(needle)) {
+      clickOption(opt)
+      console.log(`[CS] ✓ Custom dropdown (partial): "${opt.textContent?.trim()}"`)
+      await delay(150)
+      return true
+    }
+  }
+
+  // 3. Fallback: pick the FIRST real option (better than leaving required field empty)
+  const firstMeaningful = options.find(o => {
+    const txt = o.textContent?.trim() ?? ''
+    return txt.length > 0 && txt.length < 120
+  })
+  if (firstMeaningful && isRequiredEl(el)) {
+    clickOption(firstMeaningful)
+    console.log(`[CS] ✓ Custom dropdown (fallback-first): "${firstMeaningful.textContent?.trim()}"`)
+    await delay(150)
+    return true
   }
 
   // Close if nothing matched
@@ -332,6 +371,23 @@ async function fillCustomDropdown(el: Element, value: string): Promise<boolean> 
   document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
   console.warn(`[CS] Custom dropdown: no option matching "${value}"`)
   return false
+}
+
+// Open a custom dropdown, collect all option texts, then close it.
+// Used during scan to pre-fetch available options for Gemini.
+async function extractDropdownOptions(el: Element): Promise<string[]> {
+  const trigger = findDropdownTrigger(el)
+  const options = await openAndGetOptions(trigger)
+  const texts = [...new Set(
+    options
+      .map(o => o.textContent?.trim() ?? '')
+      .filter(t => t.length > 0 && t.length < 120)
+  )]
+  // Close the dropdown
+  trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+  await delay(200)
+  return texts
 }
 
 // ── Phone field helpers ────────────────────────────────────────────────────────
@@ -505,13 +561,19 @@ function getUnfilledRequired(): UnfilledField[] {
     result.push(f)
   }
 
-  // Text / email / tel / textarea
+  // Text / email / tel / textarea — EXCLUDE custom dropdown inputs (they're handled below)
   const TEXT_SEL = [
-    'input[type="text"]', 'input[type="email"]', 'input[type="tel"]',
-    'input[type="number"]', 'input[type="url"]', 'input:not([type])', 'textarea',
+    'input[type="text"]:not([readonly])',
+    'input[type="email"]:not([readonly])',
+    'input[type="tel"]:not([readonly])',
+    'input[type="number"]:not([readonly])',
+    'input[type="url"]:not([readonly])',
+    'input:not([type]):not([readonly])',
+    'textarea',
   ].join(',')
   for (const el of qAll(TEXT_SEL)) {
     if (!isVisible(el)) continue
+    if (isCustomDropdown(el)) continue // skip — handled in custom_select scan
     const inp = el as HTMLInputElement | HTMLTextAreaElement
     if (isRequiredEl(el) && !inp.value.trim()) {
       add({
@@ -627,6 +689,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   // ── GET_JOB_ELEMENTS ─────────────────────────────────────────────────────────
   if (type === 'GET_JOB_ELEMENTS') {
+    // Async: pre-fetches option lists from custom dropdowns before responding
+    ;(async () => {
     console.log('[CS] Scanning...')
 
     const TEXT_TYPES = ['text', 'email', 'tel', 'number', 'url', 'search', 'password']
@@ -678,20 +742,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .filter((el) => !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(el.tagName))
       .map((el) => info(el))
 
-    // Custom dropdowns: elements with aria-haspopup or aria-expanded that act as select triggers
-    const customSelects = qAll('[aria-haspopup], [aria-expanded]')
+    // Custom dropdowns: elements with aria-haspopup or aria-expanded that act as select triggers.
+    // We open each one briefly to extract the real available options for Gemini.
+    const customSelectEls = qAll('[aria-haspopup], [aria-expanded]')
       .filter((el) => {
-        if (!['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName) === false) return false
+        if (['SELECT', 'TEXTAREA'].includes(el.tagName)) return false
         if (!isVisible(el)) return false
-        // Exclude if it's just a regular button (e.g. Apply Now)
         const txt = el.textContent?.trim() ?? ''
         if (APPLY_RE.test(txt) || CONTINUE_RE.test(txt) || FINAL_SUBMIT_RE.test(txt)) return false
         return true
       })
-      .map((el) => {
-        const currentVal = (el as HTMLInputElement).value?.trim() || el.textContent?.trim() || ''
-        return info(el, { value: currentVal || undefined })
-      })
+
+    const customSelects: ElementInfo[] = []
+    for (const el of customSelectEls) {
+      const currentVal = (el as HTMLInputElement).value?.trim() || el.textContent?.trim() || ''
+      // Open the dropdown briefly to get the real option list
+      const opts = await extractDropdownOptions(el)
+      customSelects.push(info(el, {
+        value: currentVal || undefined,
+        options: opts.length > 0 ? opts : undefined,
+      }))
+    }
 
     const hiddenInputs: HiddenInput[] = qAll('input[type="hidden"]').map((el) => ({
       name: (el as HTMLInputElement).name || '',
@@ -714,6 +785,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       categories,
       totals,
     })
+    })() // end async IIFE
+    return true
   }
 
   // ── FILL_AND_SUBMIT ───────────────────────────────────────────────────────────
@@ -809,14 +882,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
 
       const action = submitForm ? findActionButton() : null
-      const pageAction = action ? (action.isFinal ? 'submitted' : 'continued') : 'none'
+
+      // Block final submit when required fields are still unfilled.
+      // (Continue buttons are allowed — server-side validation will show errors.)
+      const failedRequired = report.filter(r => r.status === 'failed' || r.status === 'not_found')
+      const hasUnfilledRequired = unfilledRequired.length > 0 || failedRequired.length > 0
+      const shouldBlock = action?.isFinal && hasUnfilledRequired
+      const effectiveAction = shouldBlock ? null : action
+
+      if (shouldBlock) {
+        console.warn(`[CS] Blocking submit — ${unfilledRequired.length} required field(s) still empty`)
+      }
+
+      const pageAction = effectiveAction ? (effectiveAction.isFinal ? 'submitted' : 'continued') : 'none'
       if (submitForm) {
-        console.log(`[CS] Action button: ${action ? `"${action.btn.textContent?.trim()}" isFinal=${action.isFinal}` : 'not found'}`)
+        console.log(`[CS] Action button: ${effectiveAction ? `"${effectiveAction.btn.textContent?.trim()}" isFinal=${effectiveAction.isFinal}` : shouldBlock ? 'BLOCKED (unfilled required)' : 'not found'}`)
       }
 
       sendResponse({
         filled: filledCount,
-        submitted: action?.isFinal ?? false,
+        submitted: effectiveAction?.isFinal ?? false,
         pageAction,
         report,
         url: window.location.href,
@@ -824,10 +909,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         unfilledRequired,
       })
 
-      if (action) {
+      if (effectiveAction) {
         setTimeout(() => {
-          console.log(`[CS] Clicking ${action.isFinal ? 'submit' : 'continue'}...`)
-          action.btn.click()
+          console.log(`[CS] Clicking ${effectiveAction.isFinal ? 'submit' : 'continue'}...`)
+          effectiveAction.btn.click()
         }, 200)
       }
     })()

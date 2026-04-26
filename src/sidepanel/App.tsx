@@ -438,15 +438,16 @@ UNFILLED REQUIRED FIELDS:
 ${JSON.stringify(fields, null, 2)}
 
 Rules:
-- radio (options list given): pick the most appropriate option value from the options array. For YES/NO questions, choose "yes" (the affirmative).
-- select (options list given): pick the most appropriate non-empty option value.
-- textarea / text: generate a concise, relevant answer based on the job context and demo user data.
-- invalid: re-supply the correct value — something went wrong with the previous fill.
-- ALWAYS include name or id in each instruction (use what was provided).
+- custom_select: options[] lists the ACTUAL available options from the dropdown. You MUST pick ONE value EXACTLY as written in the options array. Do NOT invent a value.
+- radio: pick the most appropriate option from the options array. For YES/NO, pick "yes".
+- select: pick the most appropriate non-empty option value from options array.
+- textarea / text: generate a concise, relevant answer based on job context and demo user.
+- invalid: re-supply the correct value for the failed field.
+- Include label AND (name or id) when provided.
 - source must be "ai_generated".
 
 Respond with ONLY a valid JSON array, no markdown:
-[{"name":"field_name","id":"field_id","label":"Field Label","value":"chosen value","source":"ai_generated"}, ...]`;
+[{"label":"Qualification","name":"CA_21168","value":"Bachelor's Degree","source":"ai_generated"}, ...]`;
 
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
@@ -567,7 +568,6 @@ Respond with ONLY a valid JSON array, no markdown:
           continueCountRef.current++;
           log(`→ Clicked Continue [page ${continueCountRef.current}/${MAX_CONTINUE}] — waiting for next page...`);
           chrome.runtime.sendMessage({ type: "WATCH_CURRENT_TAB" });
-          // TAB_READY fires on real navigation; fallback handles validation errors (page stays same)
           clickFallbackTimerRef.current = setTimeout(() => {
             clickFallbackTimerRef.current = null;
             if (isRunningRef.current) {
@@ -575,6 +575,18 @@ Respond with ONLY a valid JSON array, no markdown:
               runCycleRef.current?.();
             }
           }, 3500);
+
+        } else if (result.pageAction === "none" && (result.unfilledRequired?.length ?? 0) > 0) {
+          // Submit was blocked because required fields are still unfilled.
+          // Re-scan immediately so the next cycle sees the fresh dropdown states.
+          log(`← Submit blocked — ${result.unfilledRequired!.length} required field(s) still unfilled. Re-scanning...`);
+          for (const f of result.unfilledRequired!) {
+            log(`   [!] "${f.label}" (${f.type}${f.options?.length ? ": " + f.options.slice(0, 5).join(" | ") : ""})`);
+          }
+          clickFallbackTimerRef.current = setTimeout(() => {
+            clickFallbackTimerRef.current = null;
+            if (isRunningRef.current) runCycleRef.current?.();
+          }, 1500);
 
         } else {
           setSubmitResult(result);
