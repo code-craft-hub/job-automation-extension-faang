@@ -333,13 +333,56 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (type === 'CLICK_BUTTON') {
     const text = (message.buttonText ?? '') as string
     const APPLY_RE = /\b(apply|apply now|apply for this job|start application|begin application)\b/i
+    const LINKEDIN_RE = /linkedin/i
+
     const btn = [
       ...Array.from(document.querySelectorAll<HTMLElement>('button')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
       ...Array.from(document.querySelectorAll<HTMLElement>('a[href]')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
     ].find((el) => !text || el.textContent?.trim().toLowerCase().includes(text.toLowerCase()))
+
     if (btn) {
       sendResponse({ clicked: true })
-      setTimeout(() => btn.click(), 100)
+      setTimeout(() => {
+        btn.click()
+        // If clicking opened a dropdown, auto-click the direct apply option (not LinkedIn)
+        setTimeout(() => {
+          const DROPDOWN_SEL = [
+            '[role="menu"]', '[role="listbox"]', '[role="dialog"]',
+            '.dropdown-menu', '.dropdown-content', '.popover',
+            '[class*="dropdown"]', '[class*="Dropdown"]',
+            '[class*="popup"]',  '[class*="Popup"]',
+            '[class*="menu"]',   '[class*="Menu"]',
+          ].join(',')
+
+          let target: HTMLElement | null = null
+
+          // Search inside visible dropdown containers first
+          for (const container of Array.from(document.querySelectorAll<HTMLElement>(DROPDOWN_SEL))) {
+            if (!isVisible(container)) continue
+            const item = Array.from(
+              container.querySelectorAll<HTMLElement>('a, button, li, [role="menuitem"], [role="option"]'),
+            ).find(
+              (el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn,
+            )
+            if (item) { target = item; break }
+          }
+
+          // Fallback: any newly visible apply link/button that isn't the toggle or LinkedIn
+          if (!target) {
+            target = [
+              ...Array.from(document.querySelectorAll<HTMLElement>('a[href]'))
+                .filter((el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn),
+              ...Array.from(document.querySelectorAll<HTMLElement>('button'))
+                .filter((el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn),
+            ][0] ?? null
+          }
+
+          if (target) {
+            console.log(`[CS] Auto-clicking dropdown apply item: "${target.textContent?.trim()}"`)
+            target.click()
+          }
+        }, 600)
+      }, 100)
     } else {
       sendResponse({ clicked: false, error: 'Button not found' })
     }

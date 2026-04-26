@@ -150,6 +150,8 @@ TASK — decide ONE action:
 
 1. "click" — HIGHEST PRIORITY if applyButtons is non-empty. Visible "Apply now" or similar button found — click it to open the application form.
    - Use the text of the button as buttonText.
+   - NOTE: Some "Apply now" buttons open a dropdown menu (e.g. "Apply Now" / "Start apply with LinkedIn"). The extension automatically clicks the direct "Apply Now" option inside the dropdown — just return "click" with the outer button text and it will be handled.
+   - If you see the same applyButtons repeatedly and button count has grown (dropdown opened), still return "click" — the extension will route to the correct dropdown item.
 
 2. "fill" — if the page is clearly part of a job application process (any step of a multi-page form):
    - Standard form page (totalVisibleInputs > 0): fill the fields.
@@ -259,7 +261,7 @@ export default function App() {
   const isRunningRef = useRef(false);
   const navCountRef = useRef(0);   // steps taken to FIND the form (navigate/click)
   const continueCountRef = useRef(0); // steps taken WITHIN the form (continue/next page)
-  const MAX_NAV = 5;
+  const MAX_NAV = 8;
   const MAX_CONTINUE = 10;
   const runCycleRef = useRef<(() => Promise<void>) | null>(null);
   // Fallback timer: re-runs cycle if a click doesn't cause navigation (in-page form reveal)
