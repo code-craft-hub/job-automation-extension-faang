@@ -42,7 +42,7 @@ const JOB_LINK_RE =
   /\b(apply|application|job|career|position|opening|vacancy|hiring|recruit|join.?us|work.?with.?us|opportunities)\b/i
 
 const FINAL_SUBMIT_RE =
-  /\b(submit|send|finish|done|apply|submit application|send application|complete application|submit now|apply now)\b/i
+  /\b(submit|finish|done|submit application|send application|complete application|submit now)\b/i
 
 const CONTINUE_RE =
   /\b(continue|next|next step|save and continue|save & continue|proceed|go to next)\b/i
@@ -498,6 +498,23 @@ function stripCountryCode(phone: string): string {
 
 // ── Resume upload ──────────────────────────────────────────────────────────────
 
+// Returns true only for file inputs that expect a resume/CV (not photos, logos, etc.)
+function isResumeInput(fi: HTMLInputElement): boolean {
+  const accept = (fi.getAttribute('accept') ?? '').toLowerCase()
+  const label  = getLabel(fi).toLowerCase()
+
+  // Image-only accept → definitely not a resume field
+  if (/image\/|\.jpg|\.jpeg|\.png|\.gif|\.webp/.test(accept) && !accept.includes('pdf')) return false
+  // Label clearly says photo/picture/image/avatar → skip
+  if (/\b(photo|picture|image|avatar|headshot|profile\s*pic|logo)\b/.test(label)) return false
+
+  // Explicitly resume/CV by label or accept attribute → yes
+  if (/\b(resume|cv|curriculum)\b/.test(label) || accept.includes('pdf')) return true
+
+  // Generic file input with no clear signal → assume resume
+  return true
+}
+
 async function uploadResume(input: HTMLInputElement): Promise<boolean> {
   try {
     const url = chrome.runtime.getURL('public/cverai.resume.pdf')
@@ -898,6 +915,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       value: el.textContent?.trim() || (el as HTMLInputElement).value?.trim() || undefined,
     }))
 
+    // Contextual apply links: <a> tags whose surrounding text says "to apply" / "method of application"
+    // (e.g. "Go to Cavista on jobs.smartrecruiters.com to apply")
+    const APPLY_CONTEXT_RE = /\b(method of application|how to apply|to apply|apply (at|on|via|through)|apply here)\b/i
+    const seenApplyHrefs = new Set(applyButtons.map((b) => b.href).filter(Boolean))
+    for (const a of Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))) {
+      if (!isVisible(a)) continue
+      const href = a.href
+      if (!href || href === window.location.href || href.startsWith('javascript') || href.endsWith('#')) continue
+      if (seenApplyHrefs.has(href)) continue
+      if (/facebook|twitter|instagram|youtube|mailto:|tel:/i.test(href)) continue
+      const ctx = a.closest('p, li, div, section, article')?.textContent ?? ''
+      if (!APPLY_CONTEXT_RE.test(ctx)) continue
+      seenApplyHrefs.add(href)
+      applyButtons.push(info(a, { href, value: a.textContent?.trim() || href }))
+    }
+
     const richTextEditors = qAll('[contenteditable="true"]')
       .filter((el) => !['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName))
       .map((el) => info(el))
@@ -1025,6 +1058,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // ── 0. Upload resume to any visible file input ──────────────────────────
       const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'))
         .filter(isVisible)
+        .filter(isResumeInput)
       for (const fi of fileInputs) {
         const ok = await uploadResume(fi)
         if (ok) {

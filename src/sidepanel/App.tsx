@@ -522,18 +522,32 @@ Respond with ONLY a valid JSON array, no markdown:
           throw new Error(`Reached max ${MAX_NAV} navigations without finding a form.`);
         }
         navCountRef.current++;
-        log(`→ Clicking button [${navCountRef.current}/${MAX_NAV}]: "${decision.buttonText}"`);
-        // Tell background to watch for a new tab (Apply may open in a new tab)
-        chrome.runtime.sendMessage({ type: "WATCH_FOR_NEW_TAB" });
-        chrome.runtime.sendMessage({ type: "CLICK_BUTTON", buttonText: decision.buttonText });
-        // TAB_READY fires if navigation/new-tab happens; fallback handles in-page form reveal
-        clickFallbackTimerRef.current = setTimeout(() => {
-          clickFallbackTimerRef.current = null;
-          if (isRunningRef.current) {
-            log("← No navigation detected — re-analyzing page...");
-            runCycleRef.current?.();
-          }
-        }, 3000);
+
+        // If the matched applyButton is a direct link (href present), navigate there immediately
+        // instead of simulating a DOM click — avoids CLICK_BUTTON failing to find the element.
+        const clickText = decision.buttonText.toLowerCase();
+        const matchedBtn = elements.categories.applyButtons.find((b) => {
+          const t = (b.value ?? b.href ?? "").toLowerCase();
+          return t.includes(clickText) || clickText.includes(t);
+        });
+
+        if (matchedBtn?.href) {
+          log(`→ Navigating to apply URL [${navCountRef.current}/${MAX_NAV}]: ${matchedBtn.href}`);
+          chrome.runtime.sendMessage({ type: "NAVIGATE", url: matchedBtn.href });
+        } else {
+          log(`→ Clicking button [${navCountRef.current}/${MAX_NAV}]: "${decision.buttonText}"`);
+          // Tell background to watch for a new tab (Apply may open in a new tab)
+          chrome.runtime.sendMessage({ type: "WATCH_FOR_NEW_TAB" });
+          chrome.runtime.sendMessage({ type: "CLICK_BUTTON", buttonText: decision.buttonText });
+          // TAB_READY fires if navigation/new-tab happens; fallback handles in-page form reveal
+          clickFallbackTimerRef.current = setTimeout(() => {
+            clickFallbackTimerRef.current = null;
+            if (isRunningRef.current) {
+              log("← No navigation detected — re-analyzing page...");
+              runCycleRef.current?.();
+            }
+          }, 3000);
+        }
 
       } else {
         // ── Pass 1: fill Gemini's fields (no submit yet, triggers validation) ──────
