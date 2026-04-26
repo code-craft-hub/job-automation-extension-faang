@@ -265,18 +265,26 @@ Navigate: {"action":"navigate","reason":"...","url":"https://..."}
 Done: {"action":"done","reason":"Application confirmed — page shows 'Thank you for applying'"}`;
 }
 
-async function callGemini(apiKey: string, data: JobData): Promise<Decision> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-    {
+async function geminiPost(apiKey: string, body: object, retries = 3): Promise<Response> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: buildPrompt(data) }] }],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-    },
-  );
+      body: JSON.stringify(body),
+    });
+    if (res.status !== 429 || attempt === retries) return res;
+    const delay = 5000 * Math.pow(2, attempt); // 5s, 10s, 20s
+    await new Promise((r) => setTimeout(r, delay));
+  }
+  throw new Error("Gemini rate limit — all retries exhausted");
+}
+
+async function callGemini(apiKey: string, data: JobData): Promise<Decision> {
+  const res = await geminiPost(apiKey, {
+    contents: [{ parts: [{ text: buildPrompt(data) }] }],
+    generationConfig: { responseMimeType: "application/json" },
+  });
 
   if (!res.ok) {
     const err = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
@@ -345,9 +353,11 @@ export default function App() {
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   // Auto-loop engine refs
-  const isRunningRef = useRef(false);
-  const navCountRef = useRef(0);   // steps taken to FIND the form (navigate/click)
-  const continueCountRef = useRef(0); // steps taken WITHIN the form (continue/next page)
+  const isRunningRef    = useRef(false);
+  const isExecutingRef  = useRef(false);  // prevents concurrent runCycle calls
+  const navCountRef     = useRef(0);      // steps taken to FIND the form (navigate/click)
+  const continueCountRef = useRef(0);     // steps taken WITHIN the form (continue/next page)
+  const apiKeyRef       = useRef("");     // always-current apiKey for message handlers
   const MAX_NAV = 8;
   const MAX_CONTINUE = 10;
   const runCycleRef = useRef<(() => Promise<void>) | null>(null);
@@ -364,36 +374,16 @@ export default function App() {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  // Load API key + check for a job queued by "Apply Now" in the web app
+  // Keep apiKeyRef current so message handlers always see the latest key
+  useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
+
+  // Load API key on mount (pendingJob path is covered by START_AUTO_APPLY message)
   useEffect(() => {
-    chrome.storage.local.get(["geminiApiKey", "pendingJob"], (result) => {
+    chrome.storage.local.get("geminiApiKey", (result) => {
       const key = result.geminiApiKey as string | undefined;
-      const job = result.pendingJob as {
-        title?: string; company?: string; jobUrl?: string;
-      } | undefined;
-
-      if (key) setApiKey(key);
-
-      if (job) {
-        chrome.storage.local.remove("pendingJob");
-        const title   = job.title   ?? "Job";
-        const company = job.company ?? "";
-        setJobInfo({ title, company });
-
-        if (key) {
-          // Auto-start: set running flag now; TAB_READY fires runCycle once the job page loads
-          isRunningRef.current   = true;
-          navCountRef.current    = 0;
-          continueCountRef.current = 0;
-          setSubmitResult(null);
-          setLogs([]);
-          setPhase("running");
-          log(`Auto Apply started for: ${title}${company ? ` @ ${company}` : ""}`);
-        } else {
-          log(`Job queued: ${title}. Enter your Gemini API key above, then click Auto Apply.`);
-        }
-      } else if (key) {
-        log("API key loaded. Click Auto Apply to start.");
+      if (key) {
+        setApiKey(key);
+        log("API key loaded. Click Auto Apply or wait for a job to start.");
       } else {
         log("No API key found. Enter one above.");
       }
@@ -401,18 +391,53 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Listen for TAB_READY from background (fires when navigated tab finishes loading)
+  // Listen for messages from the background service worker
   useEffect(() => {
     const handler = (message: unknown) => {
-      if ((message as { type?: string }).type === "TAB_READY" && isRunningRef.current) {
+      const msg = message as { type?: string };
+
+      // TAB_READY: automation tab finished loading — re-run the cycle
+      if (msg.type === "TAB_READY") {
+        if (!isRunningRef.current) return;
         if (clickFallbackTimerRef.current) {
           clearTimeout(clickFallbackTimerRef.current);
           clickFallbackTimerRef.current = null;
         }
         log("← Page loaded — re-analyzing in 1s...");
         setTimeout(() => runCycleRef.current?.(), 1000);
+        return;
+      }
+
+      // START_AUTO_APPLY: background opened a background tab and wants us to start
+      // Handles both "panel was already open" and "panel just opened" cases
+      if (msg.type === "START_AUTO_APPLY") {
+        const job = msg as { title?: string; company?: string };
+        const title   = job.title   ?? "Job";
+        const company = job.company ?? "";
+        setJobInfo({ title, company });
+        setSubmitResult(null);
+        setLogs([]);
+
+        if (apiKeyRef.current.trim()) {
+          isRunningRef.current    = true;
+          isExecutingRef.current  = false;
+          navCountRef.current     = 0;
+          continueCountRef.current = 0;
+          setPhase("running");
+          log(`Auto Apply started — waiting for page to load...`);
+          // TAB_READY will fire runCycle once the background tab finishes loading.
+          // Safety fallback: if the tab loaded before we were ready, kick off after 3s.
+          setTimeout(() => {
+            if (isRunningRef.current && !isExecutingRef.current) {
+              runCycleRef.current?.();
+            }
+          }, 3000);
+        } else {
+          log(`Job queued: ${title}. Enter your Gemini API key above, then click Auto Apply.`);
+        }
       }
     };
+
     chrome.runtime.onMessage.addListener(handler);
     return () => chrome.runtime.onMessage.removeListener(handler);
   }, []);
@@ -428,7 +453,8 @@ export default function App() {
   }
 
   function stop() {
-    isRunningRef.current = false;
+    isRunningRef.current   = false;
+    isExecutingRef.current = false;
     setPhase("idle");
     log("Stopped.");
   }
@@ -518,17 +544,10 @@ Rules:
 Respond with ONLY a valid JSON array, no markdown:
 [{"label":"Qualification","name":"CA_21168","value":"Bachelor's Degree","source":"ai_generated"}, ...]`;
 
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: "application/json" },
-        }),
-      },
-    );
+    const res = await geminiPost(apiKey, {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json" },
+    });
     if (!res.ok) {
       const err = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
       throw new Error(err?.error?.message ?? `Gemini API error ${res.status}`);
@@ -543,7 +562,8 @@ Respond with ONLY a valid JSON array, no markdown:
   // ── Main loop ─────────────────────────────────────────────────────────────────
 
   async function runCycle() {
-    if (!isRunningRef.current) return;
+    if (!isRunningRef.current || isExecutingRef.current) return;
+    isExecutingRef.current = true;
 
     try {
       // Expand profile sections (Education/Experience Add buttons) before scanning
@@ -729,6 +749,8 @@ Respond with ONLY a valid JSON array, no markdown:
       setPhase("error");
       const msg = err instanceof Error ? err.message : String(err);
       log(`✗ ${msg}`);
+    } finally {
+      isExecutingRef.current = false;
     }
   }
 
