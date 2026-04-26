@@ -161,14 +161,22 @@ function countVisibleInputs(data: JobData): number {
 function buildPrompt(data: JobData): string {
   const visible = (f: FieldInfo) => f.visible !== false;
 
-  // Group radios by name — filter huge groups (phone country codes = 90+ options)
+  // Group radios by name — include ALL radios, not just visible ones.
+  // Modern ATS platforms (Ashby, Greenhouse…) often render styled radio buttons
+  // by overlaying a custom UI on top of a native <input type="radio"> that is
+  // CSS-hidden (opacity:0 / display:none). Filtering by visibility would silently
+  // drop all options and leave Gemini with no data for these questions.
   const radioGroupMap: Record<string, { label: string; name: string; required?: boolean; options: string[] }> = {};
-  for (const f of data.categories.radios.filter(visible)) {
+  for (const f of data.categories.radios) {
     const key = f.name ?? "_";
     if (!radioGroupMap[key]) radioGroupMap[key] = { label: f.label, name: key, required: f.required, options: [] };
-    if (f.value && !radioGroupMap[key].options.includes(f.value)) radioGroupMap[key].options.push(f.value);
+    // Use the display label (f.label) as the option text when available and
+    // different from the group label (covers label=value patterns).
+    const optionText = f.value ?? f.label;
+    if (optionText && !radioGroupMap[key].options.includes(optionText)) radioGroupMap[key].options.push(optionText);
   }
-  const radioGroups = Object.values(radioGroupMap).filter((g) => g.options.length <= 8);
+  // Drop huge groups (phone country-code selectors have 90+ options) and empty groups
+  const radioGroups = Object.values(radioGroupMap).filter((g) => g.options.length >= 2 && g.options.length <= 12);
 
   const summary = {
     url: data.url,

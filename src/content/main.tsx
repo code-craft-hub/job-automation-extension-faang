@@ -409,11 +409,36 @@ async function fillCustomDropdown(el: Element, value: string): Promise<boolean> 
   const label   = getLabel(el)
 
   // ── Step 1: Open and collect all available options ──────────────────────────
-  const options = await openAndGetOptions(trigger)
+  let options = await openAndGetOptions(trigger)
+
+  // ── Step 1b: Search-type autocomplete fallback ───────────────────────────────
+  // Some fields (e.g. location/city pickers) load options only after the user types.
+  // If the dropdown opened but produced no options, try typing the value to trigger
+  // the async suggestion fetch, then re-collect.
   if (options.length === 0) {
-    console.warn(`[CS] Custom dropdown "${label}": opened but no options found`)
-    closeDropdown(trigger)
-    return false
+    const searchInput: HTMLInputElement | null =
+      (trigger.tagName === 'INPUT' ? (trigger as HTMLInputElement) : null) ??
+      trigger.querySelector<HTMLInputElement>('input') ??
+      Array.from(document.querySelectorAll<HTMLInputElement>(
+        'input[type="search"], input[placeholder*="ype"], input[placeholder*="earch"], input[placeholder*="ilter"], input[placeholder*="ocation"], input[placeholder*="ity"]',
+      )).find(isVisible) ??
+      null
+
+    if (searchInput) {
+      console.log(`[CS] Custom dropdown "${label}": search-type — typing "${value}"`)
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(searchInput, value)
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }))
+      searchInput.dispatchEvent(new Event('change', { bubbles: true }))
+      await delay(1000) // allow async API suggestions to load
+      options = collectVisibleOptions()
+    }
+
+    if (options.length === 0) {
+      console.warn(`[CS] Custom dropdown "${label}": opened but no options found`)
+      closeDropdown(trigger)
+      return false
+    }
   }
 
   const optionTexts = [...new Set(
@@ -710,21 +735,121 @@ function fillElement(el: Element, value: string): boolean | 'custom' {
   } else if (type === 'checkbox') {
     const cb = el as HTMLInputElement
     const shouldCheck = ['true', '1', 'yes', 'checked', 'on'].includes(value.toLowerCase())
-    if (cb.checked !== shouldCheck) cb.click()
+    if (cb.checked !== shouldCheck) {
+      // Click parent <label> when available — covers custom-styled checkboxes.
+      const cbClickTarget: HTMLElement = cb.closest('label') ?? cb
+      cbClickTarget.click()
+      cb.dispatchEvent(new Event('change', { bubbles: true }))
+      cb.dispatchEvent(new Event('input', { bubbles: true }))
+      // React internal handler (same pattern as radio above)
+      const cbReactKey = Object.keys(cb).find(
+        (k) => k.startsWith('__reactEventHandlers') || k.startsWith('__reactProps'),
+      )
+      if (cbReactKey) {
+        const rProps = (cb as unknown as Record<string, Record<string, unknown>>)[cbReactKey]
+        if (typeof rProps?.onChange === 'function') {
+          ;(rProps.onChange as (e: unknown) => void)({
+            target: cb, currentTarget: cb, type: 'change',
+            bubbles: true, cancelable: true, isTrusted: false,
+            preventDefault: () => {}, stopPropagation: () => {},
+          })
+        }
+      }
+    }
     filled = true
 
   } else if (type === 'radio') {
     const name = el.getAttribute('name')
+
+    // Collect all radios in this group: by name attribute first,
+    // then fall back to the nearest fieldset / radiogroup container.
+    const allRadios: HTMLInputElement[] = []
     if (name) {
       try {
-        const target = Array.from(
+        allRadios.push(...Array.from(
           document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${CSS.escape(name)}"]`),
-        ).find((r) => r.value.toLowerCase() === value.toLowerCase())
-        if (!target) { console.warn(`[CS] No radio value="${value}" in group="${name}"`); return false }
-        if (!target.checked) target.click()
-        filled = true
-      } catch { return false }
+        ))
+      } catch { /* noop */ }
     }
+    if (allRadios.length === 0) {
+      const container =
+        el.closest('fieldset') ??
+        el.closest('[role="radiogroup"]') ??
+        el.parentElement?.parentElement ??
+        el.parentElement
+      if (container) allRadios.push(...Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]')))
+      if (allRadios.length === 0) allRadios.push(el as HTMLInputElement)
+    }
+
+    const needle = normalizeText(value)
+    const target = allRadios.find((r) => {
+      // 1. Value attribute (case-insensitive, partial)
+      const rv = normalizeText(r.value)
+      if (rv && (rv === needle || rv.includes(needle) || needle.includes(rv))) return true
+      // 2. aria-label on the input
+      const al = normalizeText(r.getAttribute('aria-label') ?? '')
+      if (al && (al === needle || al.includes(needle) || needle.includes(al))) return true
+      // 3. Parent <label> text — covers <label><input /><span>LinkedIn</span></label>
+      const parentLabel = r.closest('label')
+      if (parentLabel) {
+        const lt = normalizeText(parentLabel.textContent ?? '')
+        if (lt && (lt === needle || lt.includes(needle) || needle.includes(lt))) return true
+      }
+      // 4. Next sibling text — covers <input /><span>LinkedIn</span>
+      const nextEl = r.nextElementSibling
+      if (nextEl) {
+        const nt = normalizeText(nextEl.textContent ?? '')
+        if (nt && (nt === needle || nt.includes(needle) || needle.includes(nt))) return true
+      }
+      // 5. Associated <label for="id"> text
+      if (r.id) {
+        try {
+          const forLbl = document.querySelector<HTMLElement>(`label[for="${CSS.escape(r.id)}"]`)
+          if (forLbl) {
+            const ft = normalizeText(forLbl.textContent ?? '')
+            if (ft && (ft === needle || ft.includes(needle) || needle.includes(ft))) return true
+          }
+        } catch { /* noop */ }
+      }
+      return false
+    })
+
+    if (!target) {
+      console.warn(`[CS] No radio matching "${value}" in group "${name ?? 'unnamed'}"`)
+      return false
+    }
+
+    // Prefer clicking the parent <label> — covers styled radio buttons where the
+    // native <input> is opacity:0/display:none and the click handler is on the label.
+    const radioClickTarget: HTMLElement = target.closest('label') ?? target
+    if (!target.checked) {
+      radioClickTarget.click()
+      // Dispatch change/input for React controlled components.
+      // React's synthetic event system is attached to the root container; these
+      // bubbling events reach it and trigger the form state update.
+      target.dispatchEvent(new Event('change', { bubbles: true }))
+      target.dispatchEvent(new Event('input', { bubbles: true }))
+
+      // Also call React's internal onChange directly when available.
+      // React 17+ stores props under __reactProps$<hash>, React 16 under __reactEventHandlers$<hash>.
+      // Direct call ensures the form library (react-hook-form / formik) updates
+      // its internal state even if it ignores untrusted bubbling events.
+      const reactKey = Object.keys(target).find(
+        (k) => k.startsWith('__reactEventHandlers') || k.startsWith('__reactProps'),
+      )
+      if (reactKey) {
+        const rProps = (target as unknown as Record<string, Record<string, unknown>>)[reactKey]
+        if (typeof rProps?.onChange === 'function') {
+          ;(rProps.onChange as (e: unknown) => void)({
+            target, currentTarget: target, type: 'change',
+            bubbles: true, cancelable: true, isTrusted: false,
+            preventDefault: () => {}, stopPropagation: () => {},
+          })
+        }
+      }
+    }
+    console.log(`[CS] ✓ Radio "${name ?? 'unnamed'}": matched "${target.value || value}"`)
+    filled = true
 
   } else if (tag === 'textarea') {
     const ta = el as HTMLTextAreaElement
