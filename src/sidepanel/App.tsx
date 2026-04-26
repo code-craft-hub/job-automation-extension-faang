@@ -7,6 +7,7 @@ type FieldInfo = {
   name?: string;
   id?: string;
   required?: boolean;
+  visible?: boolean;
   value?: string;
   href?: string;
   options?: string[];
@@ -72,45 +73,33 @@ const DEMO_USER = {
 // ── Gemini ────────────────────────────────────────────────────────────────────
 
 function buildPrompt(data: JobData): string {
+  // Only pass visible elements to Gemini — hidden fields belong to collapsed
+  // modals, off-screen sections, or site chrome (search bars, subscriptions).
+  const visible = (f: FieldInfo) => f.visible !== false;
+
+  const visibleTextFields = data.categories.textFields.filter(visible);
+  const visibleDateFields = data.categories.dateFields.filter(visible);
+  const visibleFileUploads = data.categories.fileUploads.filter(visible);
+  const visibleCheckboxes = data.categories.checkboxes.filter(visible);
+  const visibleRadios = data.categories.radios.filter(visible);
+  const visibleDropdowns = data.categories.dropdowns.filter(visible);
+  const visibleTextareas = data.categories.textareas.filter(visible);
+
   const summary = {
     url: data.url,
     title: data.title,
-    textFields: data.categories.textFields.map((f) => ({
-      label: f.label,
-      name: f.name,
-      id: f.id,
-      required: f.required,
-    })),
-    dateFields: data.categories.dateFields.map((f) => ({
-      label: f.label,
-      name: f.name,
-      id: f.id,
-    })),
-    fileUploads: data.categories.fileUploads.map((f) => ({
-      label: f.label,
-      name: f.name,
-      accept: f.value,
-    })),
-    checkboxes: data.categories.checkboxes.map((f) => ({
-      label: f.label,
-      name: f.name,
-    })),
-    radios: data.categories.radios.map((f) => ({
-      label: f.label,
-      name: f.name,
-      value: f.value,
-    })),
-    dropdowns: data.categories.dropdowns.map((f) => ({
-      label: f.label,
-      name: f.name,
-      options: f.options?.slice(0, 8),
-    })),
-    textareas: data.categories.textareas.map((f) => ({
-      label: f.label,
-      name: f.name,
-      id: f.id,
-      required: f.required,
-    })),
+    visibleFormFields: {
+      textFields: visibleTextFields.map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
+      dateFields: visibleDateFields.map((f) => ({ label: f.label, name: f.name, id: f.id })),
+      fileUploads: visibleFileUploads.map((f) => ({ label: f.label, name: f.name, accept: f.value })),
+      checkboxes: visibleCheckboxes.map((f) => ({ label: f.label, name: f.name })),
+      radios: visibleRadios.map((f) => ({ label: f.label, name: f.name, value: f.value })),
+      dropdowns: visibleDropdowns.map((f) => ({ label: f.label, name: f.name, options: f.options?.slice(0, 8) })),
+      textareas: visibleTextareas.map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
+    },
+    totalVisibleInputs:
+      visibleTextFields.length + visibleDateFields.length + visibleFileUploads.length +
+      visibleCheckboxes.length + visibleRadios.length + visibleDropdowns.length + visibleTextareas.length,
     navigationLinks: data.categories.navigationLinks.slice(0, 10).map((f) => ({
       text: f.value,
       href: f.href,
@@ -122,20 +111,21 @@ function buildPrompt(data: JobData): string {
 DEMO USER DATA:
 ${JSON.stringify(DEMO_USER, null, 2)}
 
-PAGE ELEMENTS:
+PAGE ELEMENTS (visible only — hidden/collapsed fields are excluded):
 ${JSON.stringify(summary, null, 2)}
 
 TASK:
 Decide ONE action:
-1. "fill" — if this page has a job application form with fields to fill in
-2. "navigate" — if this page is a job listing/search page with links to navigate to
+1. "fill" — ONLY if totalVisibleInputs > 2 AND the visible fields are clearly part of a job application form (name, email, CV, cover letter, etc.)
+2. "navigate" — if this looks like a job listing/description page, OR if visible form fields are just a search bar or email subscription (not an application form)
 
-For "fill": map the demo user data to each form field. Use the "name" attribute to identify fields (fall back to "id"). Only include relevant, visible fields. Skip CSRF/tracking hidden fields.
+Key rule: if the page is a job listing showing a description, qualifications, and "how to apply" instructions — choose "navigate" even if some form fields exist on the page.
 
-For "navigate": choose the single best URL from navigationLinks that leads directly to a job application or posting.
+For "fill": map demo user data to each visible field. Use "name" to identify fields (fall back to "id").
+For "navigate": pick the single best URL from navigationLinks that leads to an application form or apply page.
 
-Respond with ONLY valid JSON, no markdown or extra text:
-Fill: {"action":"fill","reason":"...","fills":[{"name":"fieldName","value":"..."},{"id":"fieldId","value":"..."}]}
+Respond with ONLY valid JSON, no markdown:
+Fill: {"action":"fill","reason":"...","fills":[{"name":"fieldName","value":"..."}]}
 Navigate: {"action":"navigate","reason":"...","url":"https://..."}`;
 }
 
@@ -265,7 +255,17 @@ export default function App() {
         .filter(([, v]) => v > 0)
         .map(([k, v]) => `${k}=${v}`)
         .join(", ");
+      const visibleInputs = [
+        ...elements.categories.textFields,
+        ...elements.categories.dateFields,
+        ...elements.categories.fileUploads,
+        ...elements.categories.checkboxes,
+        ...elements.categories.radios,
+        ...elements.categories.dropdowns,
+        ...elements.categories.textareas,
+      ].filter((f) => f.visible !== false).length;
       log(`← Elements received — ${totals}`);
+      log(`   Visible inputs: ${visibleInputs} (hidden inputs excluded from Gemini prompt)`);
       log(`   Page: "${elements.title}" (${elements.url})`);
 
       setStatus("Sending to Gemini...");

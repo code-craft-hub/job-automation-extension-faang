@@ -21,9 +21,11 @@ export default defineManifest({
     'sidePanel',
     'contentSettings',
     'storage',
+    'scripting',
   ],
   host_permissions: [
     'https://generativelanguage.googleapis.com/*',
+    'https://*/*',
   ],
   content_scripts: [{
     js: ['src/content/main.tsx'],
