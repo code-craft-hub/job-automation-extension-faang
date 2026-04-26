@@ -58,6 +58,7 @@ type FillReportItem = {
 type SubmitResult = {
   filled: number;
   submitted: boolean;
+  pageAction: "submitted" | "continued" | "none";
   report: FillReportItem[];
   url: string;
   title: string;
@@ -147,22 +148,24 @@ ${JSON.stringify(summary, null, 2)}
 
 TASK — decide ONE action:
 
-1. "fill" — ONLY if totalVisibleInputs > 2 AND the visible fields are clearly a job application form (name, email, CV, cover letter, etc.).
-   - Map demo user data to matching fields (source: "demo_user")
-   - For fields NOT covered by demo user data (e.g. "Why do you want this role?", "Describe your experience with X", specific skill assessments), generate a realistic, relevant answer based on the job page context and the user's background (source: "ai_generated")
-   - Every fill must include: name or id, label (human-readable field name), value, source
-
-2. "click" — HIGHEST PRIORITY if applyButtons is non-empty. This means there is a visible "Apply now" or similar button on the page. Click it to reach the application form.
+1. "click" — HIGHEST PRIORITY if applyButtons is non-empty. Visible "Apply now" or similar button found — click it to open the application form.
    - Use the text of the button as buttonText.
 
-3. "navigate" — if this is a job listing/description page with NO applyButtons, OR if visible inputs are just a search bar / email subscription form (not an application).
-   - Choose the single best URL from navigationLinks that leads to a job application form.
-   - ONLY use a URL that actually appears in navigationLinks. If no suitable URL exists, use the "click" action instead.
+2. "fill" — if the page is clearly part of a job application process (any step of a multi-page form):
+   - Standard form page (totalVisibleInputs > 0): fill the fields.
+     * Map demo user data to matching fields (source: "demo_user")
+     * For open-ended questions (e.g. "Why do you want this role?", skills assessments), generate a realistic answer from the job context (source: "ai_generated")
+     * Every fill: name or id, label, value, source
+   - Review/confirmation page (totalVisibleInputs = 0 but page shows entered data or a final Submit button): return fills:[] (empty array). The extension will click the Submit button automatically.
+
+3. "navigate" — ONLY if this is a pure job listing/description page with NO applyButtons and NO application form visible.
+   - Choose the best URL from navigationLinks that leads toward an application form.
+   - ONLY use a real URL from navigationLinks. NEVER return null or an invented URL.
 
 Key rules:
-- If applyButtons is non-empty → always choose "click" first.
-- If the page shows a job description with no real application form fields and no applyButtons → choose "navigate" only with a real URL from navigationLinks.
-- NEVER return null or a made-up URL.
+- applyButtons non-empty → always "click"
+- Any page that is a step of a job application form (including review/upload/personal info pages) → always "fill"
+- Pure listing page with no form and no applyButtons → "navigate"
 
 Respond with ONLY valid JSON, no markdown:
 Fill: {"action":"fill","reason":"...","fills":[{"name":"fn","label":"First Name","value":"John","source":"demo_user"},...]}
@@ -209,7 +212,7 @@ function renderReport(result: SubmitResult): string {
     "── SUBMIT REPORT ─────────────────────────────",
     `Page:      ${result.title}`,
     `URL:       ${result.url}`,
-    `Submitted: ${result.submitted ? "YES ✓" : "NO (submit button not found)"}`,
+    `Submitted: ${result.submitted ? "YES ✓" : result.pageAction === "continued" ? "CONTINUED →" : "NO (submit button not found)"}`,
     `Filled:    ${result.filled}/${result.report.length} fields`,
     "",
   ];
@@ -250,8 +253,10 @@ export default function App() {
 
   // Auto-loop engine refs
   const isRunningRef = useRef(false);
-  const navCountRef = useRef(0);
+  const navCountRef = useRef(0);   // steps taken to FIND the form (navigate/click)
+  const continueCountRef = useRef(0); // steps taken WITHIN the form (continue/next page)
   const MAX_NAV = 5;
+  const MAX_CONTINUE = 10;
   const runCycleRef = useRef<(() => Promise<void>) | null>(null);
 
   function log(msg: string) {
@@ -383,17 +388,37 @@ export default function App() {
         // TAB_READY will fire when page/new tab finishes loading
 
       } else {
-        log(`→ Filling ${decision.fills.length} field(s)...`);
-        for (const f of decision.fills) {
-          const tag = f.source === "ai_generated" ? "[AI]" : "[demo]";
-          log(`   ${tag} "${f.label ?? f.name ?? f.id}" = "${f.value}"`);
+        if (decision.fills.length > 0) {
+          log(`→ Filling ${decision.fills.length} field(s)...`);
+          for (const f of decision.fills) {
+            const tag = f.source === "ai_generated" ? "[AI]" : "[demo]";
+            log(`   ${tag} "${f.label ?? f.name ?? f.id}" = "${f.value}"`);
+          }
+        } else {
+          log("→ Review page detected — looking for Submit button...");
         }
 
         const result = await doFillAndSubmit(decision.fills);
-        setSubmitResult(result);
-        setPhase("done");
-        isRunningRef.current = false;
-        log(`✓ Done! Filled ${result.filled}/${decision.fills.length} field(s). Submitted: ${result.submitted ? "YES" : "NO"}`);
+
+        if (result.pageAction === "continued") {
+          if (continueCountRef.current >= MAX_CONTINUE) {
+            throw new Error(`Reached max ${MAX_CONTINUE} form pages without final submission.`);
+          }
+          continueCountRef.current++;
+          log(`→ Clicked Continue [page ${continueCountRef.current}/${MAX_CONTINUE}] — waiting for next page...`);
+          chrome.runtime.sendMessage({ type: "WATCH_CURRENT_TAB" });
+          // TAB_READY will trigger the next runCycle
+
+        } else {
+          setSubmitResult(result);
+          setPhase("done");
+          isRunningRef.current = false;
+          if (result.submitted) {
+            log(`✓ Application submitted! Filled ${result.filled} field(s) across ${continueCountRef.current + 1} page(s).`);
+          } else {
+            log(`✓ Done (no submit button found). Filled ${result.filled} field(s).`);
+          }
+        }
       }
     } catch (err) {
       isRunningRef.current = false;
@@ -407,6 +432,7 @@ export default function App() {
     if (!apiKey.trim()) { log("✗ No API key set."); return; }
     isRunningRef.current = true;
     navCountRef.current = 0;
+    continueCountRef.current = 0;
     setSubmitResult(null);
     setLogs([]);
     setPhase("running");
@@ -418,7 +444,7 @@ export default function App() {
 
   const phaseLabel: Record<Phase, string> = {
     idle: "",
-    running: `Running... (navigations: ${navCountRef.current}/${MAX_NAV})`,
+    running: `Running... (nav: ${navCountRef.current}/${MAX_NAV}, pages: ${continueCountRef.current}/${MAX_CONTINUE})`,
     done: "✓ Complete",
     error: "✗ Stopped with error",
   };

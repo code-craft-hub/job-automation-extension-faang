@@ -110,13 +110,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (type === 'WATCH_FOR_NEW_TAB') {
-    // Side panel tells us a click may open a new tab — watch for it
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tabId = tabs[0]?.id
       if (tabId) {
         watchedOpenerTabId = tabId
         watchedTabId = null
         console.log(`[BG] Watching tab ${tabId} for child tab creation`)
+      }
+      sendResponse({})
+    })
+    return true
+  }
+
+  if (type === 'WATCH_CURRENT_TAB') {
+    // Side panel clicked a Continue button — watch for the current tab to reload
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tabId = tabs[0]?.id
+      if (tabId) {
+        watchedTabId = tabId
+        watchedOpenerTabId = null
+        console.log(`[BG] Watching current tab ${tabId} for reload after Continue`)
       }
       sendResponse({})
     })

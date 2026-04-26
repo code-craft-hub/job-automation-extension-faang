@@ -33,8 +33,11 @@ type FillReport = {
 const JOB_LINK_RE =
   /\b(apply|application|job|career|position|opening|vacancy|hiring|recruit|join.?us|work.?with.?us|opportunities)\b/i
 
-const SUBMIT_RE =
-  /\b(submit|apply|send application|send|finish|complete application|submit application)\b/i
+const FINAL_SUBMIT_RE =
+  /\b(submit|send|finish|done|apply|submit application|send application|complete application|submit now|apply now)\b/i
+
+const CONTINUE_RE =
+  /\b(continue|next|next step|save and continue|save & continue|proceed|go to next)\b/i
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -112,17 +115,28 @@ function getPageText(): string {
   return container.innerText.replace(/\s+/g, ' ').trim().slice(0, 3000)
 }
 
-function findSubmitButton(): HTMLElement | null {
-  const explicit = document.querySelector<HTMLElement>(
-    'input[type="submit"], button[type="submit"]',
-  )
-  if (explicit && isVisible(explicit)) return explicit
+function findActionButton(): { btn: HTMLElement; isFinal: boolean } | null {
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLElement>('button, input[type="submit"], input[type="button"]'),
+  ).filter(isVisible)
 
-  return (
-    Array.from(document.querySelectorAll<HTMLElement>('button, input[type="button"]')).find(
-      (btn) => SUBMIT_RE.test(btn.textContent ?? '') && isVisible(btn),
-    ) ?? null
+  let finalBtn: HTMLElement | null = null
+  let continueBtn: HTMLElement | null = null
+
+  for (const btn of candidates) {
+    const text = btn.textContent?.trim() || (btn as HTMLInputElement).value || ''
+    if (!continueBtn && CONTINUE_RE.test(text)) continueBtn = btn
+    if (!finalBtn && FINAL_SUBMIT_RE.test(text)) finalBtn = btn
+  }
+
+  if (finalBtn) return { btn: finalBtn, isFinal: true }
+  if (continueBtn) return { btn: continueBtn, isFinal: false }
+
+  // Fallback: any explicit type="submit" that isn't labeled as continue
+  const explicit = candidates.find(
+    (b) => b.getAttribute('type') === 'submit' && !CONTINUE_RE.test(b.textContent?.trim() ?? ''),
   )
+  return explicit ? { btn: explicit, isFinal: true } : null
 }
 
 function fillElement(el: Element, value: string): boolean {
@@ -294,22 +308,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
     }
 
-    const submitBtn = findSubmitButton()
-    console.log(`[CS] Submit button: ${submitBtn ? `<${submitBtn.tagName.toLowerCase()}> "${submitBtn.textContent?.trim()}"` : 'not found'}`)
+    const action = findActionButton()
+    const pageAction = action ? (action.isFinal ? 'submitted' : 'continued') : 'none'
+    console.log(`[CS] Action button: ${action ? `<${action.btn.tagName.toLowerCase()}> "${action.btn.textContent?.trim()}" isFinal=${action.isFinal}` : 'not found'}`)
 
-    // Send report BEFORE clicking submit — submit may cause page navigation
+    // Send report BEFORE clicking — clicking may cause page navigation
     sendResponse({
       filled: filledCount,
-      submitted: !!submitBtn,
+      submitted: action?.isFinal ?? false,
+      pageAction,
       report,
       url: window.location.href,
       title: document.title,
     })
 
-    if (submitBtn) {
+    if (action) {
       setTimeout(() => {
-        console.log('[CS] Clicking submit...')
-        submitBtn.click()
+        console.log(`[CS] Clicking ${action.isFinal ? 'submit' : 'continue'}...`)
+        action.btn.click()
       }, 200)
     }
   }
