@@ -31,6 +31,7 @@ type JobData = {
     applyButtons: FieldInfo[];
     richTextEditors: FieldInfo[];
     customComponents: FieldInfo[];
+    customSelects: FieldInfo[];
     hiddenInputs: FieldInfo[];
   };
 };
@@ -92,9 +93,6 @@ const DEMO_USER = {
   currentCompany: "Tech Corp",
   currentTitle: "Software Engineer",
   yearsExperience: "5",
-  education: "Bachelor's in Computer Science",
-  university: "University of California",
-  graduationYear: "2019",
   skills: "JavaScript, TypeScript, React, Node.js, Python",
   salaryExpectation: "120000",
   noticePeriod: "2 weeks",
@@ -102,6 +100,38 @@ const DEMO_USER = {
   requiresSponsorship: "No",
   coverLetter:
     "Dear Hiring Manager,\n\nI am excited to apply for this position. With 5 years of software engineering experience, I bring strong expertise in JavaScript, TypeScript, React, and Node.js.\n\nBest regards,\nJohn Doe",
+  // Structured education history (for profile sections)
+  educationHistory: [
+    {
+      school: "University of California, Berkeley",
+      degree: "Bachelor of Science",
+      fieldOfStudy: "Computer Science",
+      startYear: "2015",
+      endYear: "2019",
+      gpa: "3.8",
+    },
+  ],
+  // Structured work experience (for profile sections)
+  workExperience: [
+    {
+      company: "Tech Corp",
+      title: "Software Engineer",
+      startDate: "07/2019",
+      endDate: "present",
+      description:
+        "Developed full-stack web applications using React, TypeScript, and Node.js. Led a team of 3 engineers and improved application performance by 40%.",
+    },
+    {
+      company: "StartupXYZ",
+      title: "Junior Developer",
+      startDate: "05/2018",
+      endDate: "06/2019",
+      description:
+        "Worked on front-end development with React and Redux. Implemented UI components and integrated REST APIs.",
+    },
+  ],
+  // Sentinel value — triggers automatic PDF upload to file inputs
+  resumeFile: "[RESUME]",
 };
 
 // ── Gemini ─────────────────────────────────────────────────────────────────────
@@ -115,6 +145,7 @@ function countVisibleInputs(data: JobData): number {
     ...data.categories.radios,
     ...data.categories.dropdowns,
     ...data.categories.textareas,
+    ...data.categories.customSelects,
   ].filter((f) => f.visible !== false).length;
 }
 
@@ -137,17 +168,19 @@ function buildPrompt(data: JobData): string {
     visibleFormFields: {
       textFields: data.categories.textFields.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
       dateFields: data.categories.dateFields.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id })),
-      fileUploads: data.categories.fileUploads.filter(visible).map((f) => ({ label: f.label, name: f.name, accept: f.value })),
+      fileUploads: data.categories.fileUploads.filter(visible).map((f) => ({ label: f.label, name: f.name, accept: f.value, note: "Extension auto-uploads resume — no fill instruction needed" })),
       checkboxes: data.categories.checkboxes.filter(visible).map((f) => ({ label: f.label, name: f.name, required: f.required })),
       radioGroups,
       dropdowns: data.categories.dropdowns.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required, options: f.options?.slice(0, 12) })),
+      // Custom React/JS dropdowns — fill by label; extension will click-open and pick the option
+      customSelects: data.categories.customSelects.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required, currentValue: f.value })),
       textareas: data.categories.textareas.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
     },
     applyButtons: data.categories.applyButtons.map((f) => ({ text: f.value, href: f.href ?? null })),
     navigationLinks: data.categories.navigationLinks.map((f) => ({ text: f.value, href: f.href })),
   };
 
-  return `You are a job application assistant.
+  return `You are a job application assistant helping fill out a job application form.
 
 DEMO USER DATA:
 ${JSON.stringify(DEMO_USER, null, 2)}
@@ -160,31 +193,32 @@ ${JSON.stringify(summary, null, 2)}
 
 TASK — decide ONE action:
 
-1. "click" — HIGHEST PRIORITY if applyButtons is non-empty. Visible "Apply now" or similar button found — click it to open the application form.
-   - Use the text of the button as buttonText.
-   - NOTE: Some "Apply now" buttons open a dropdown menu (e.g. "Apply Now" / "Start apply with LinkedIn"). The extension automatically clicks the direct "Apply Now" option inside the dropdown — just return "click" with the outer button text and it will be handled.
-   - If you see the same applyButtons repeatedly and button count has grown (dropdown opened), still return "click" — the extension will route to the correct dropdown item.
+1. "click" — HIGHEST PRIORITY if applyButtons is non-empty.
+   - Use the button text as buttonText.
+   - Some "Apply now" buttons open a dropdown — the extension auto-handles the sub-item click.
 
-2. "fill" — if the page is clearly part of a job application process (any step of a multi-page form):
+2. "fill" — if the page is clearly part of a job application (any form step):
    - Fill EVERY visible form field. Nothing should be skipped or left empty.
-   - textFields / textareas: match to demo user data where possible (source:"demo_user"); generate a short, relevant answer for unmatched fields (source:"ai_generated").
-   - radioGroups: for each group pick one option value. For YES/NO-style questions, pick "yes" (or the affirmative option) for skills/qualifications questions.
-   - dropdowns: pick the most appropriate option from the options list. For required dropdowns, ALWAYS pick a non-placeholder value.
+   - textFields / textareas: match demo user data (source:"demo_user"); generate concise relevant answers for unmatched fields (source:"ai_generated").
+   - customSelects: MUST include a fill instruction for EACH custom select. Pick the most appropriate value for the context (e.g. for "Qualification" choose a degree level like "Master's Degree"; for "Areas of Expertise" choose the most relevant expertise). Match by label. The extension will click-open and auto-select the option.
+   - dropdowns (native): pick the most appropriate non-placeholder option.
+   - radioGroups: pick one option value. For YES/NO questions, pick "yes".
    - checkboxes: Terms/consent/privacy → value:"true". Marketing opt-in → value:"false". When in doubt, value:"true".
-   - Every fill instruction must include: name OR id, label, value, source.
-   - Review/confirmation page (totalVisibleInputs=0 but shows a Submit button): return fills:[] — the extension clicks Submit automatically.
+   - fileUploads: DO NOT include fill instructions — the extension auto-uploads the resume PDF.
+   - Education/Experience fields (school, degree, company, job title, start/end dates): fill using DEMO_USER.educationHistory[0] and DEMO_USER.workExperience[0].
+   - Every fill instruction must include: label AND (name OR id if available), value, source.
+   - Review page (totalVisibleInputs=0, submit button visible): return fills:[] — extension clicks Submit automatically.
 
-3. "navigate" — ONLY if this is a pure job listing/description page with NO applyButtons and NO application form visible.
-   - Choose the best URL from navigationLinks that leads toward an application form.
-   - ONLY use a real URL from navigationLinks. NEVER return null or an invented URL.
+3. "navigate" — ONLY if pure listing page with NO applyButtons and NO form visible.
+   - Use a real URL from navigationLinks. NEVER invent a URL.
 
 Key rules:
 - applyButtons non-empty → always "click"
-- Any page with a form (any step) → always "fill" every single field
-- Pure listing page with no form and no applyButtons → "navigate"
+- Any page with a form → always "fill" every single visible field including all customSelects
+- Pure listing with no form and no applyButtons → "navigate"
 
 Respond with ONLY valid JSON, no markdown:
-Fill: {"action":"fill","reason":"...","fills":[{"name":"fn","label":"First Name","value":"John","source":"demo_user"},...]}
+Fill: {"action":"fill","reason":"...","fills":[{"label":"Qualification","value":"Master's Degree","source":"demo_user"},{"label":"Areas of Expertise Sought","value":"Software Engineering","source":"ai_generated"},...]}
 Click: {"action":"click","reason":"...","buttonText":"Apply now"}
 Navigate: {"action":"navigate","reason":"...","url":"https://..."}`;
 }
@@ -380,6 +414,16 @@ export default function App() {
     });
   }
 
+  // Click "Add Education" / "Add Experience" buttons so their fields become visible before scanning.
+  function expandProfileSections(): Promise<{ expanded: number }> {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "EXPAND_PROFILE_SECTIONS" }, (response) => {
+        if (chrome.runtime.lastError) { resolve({ expanded: 0 }); return; }
+        resolve((response as { expanded: number }) ?? { expanded: 0 });
+      });
+    });
+  }
+
   // Ask Gemini specifically for fill values for fields that are still empty/required.
   async function callGeminiForRemaining(fields: UnfilledField[], pageText: string): Promise<FillInstruction[]> {
     const prompt = `You are a job application assistant. These required form fields are still empty after the initial fill pass. Generate ONE fill value for EACH field.
@@ -432,6 +476,11 @@ Respond with ONLY a valid JSON array, no markdown:
     if (!isRunningRef.current) return;
 
     try {
+      // Expand profile sections (Education/Experience Add buttons) before scanning
+      // so the revealed fields are visible to the scanner and Gemini.
+      const expanded = await expandProfileSections();
+      if (expanded.expanded > 0) log(`← Expanded ${expanded.expanded} profile section(s)`);
+
       log(`[step ${navCountRef.current + 1}] Scanning page elements...`);
       const elements = await scanPage();
 

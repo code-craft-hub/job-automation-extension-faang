@@ -157,24 +157,26 @@ function findActionButton(): { btn: HTMLElement; isFinal: boolean } | null {
 
 // ── Custom dropdown detection ──────────────────────────────────────────────────
 
-// Returns true when the element (or its close ancestor) is a custom React/JS dropdown,
-// not a native <select>.  These need a click sequence to open + pick an option.
 function isCustomDropdown(el: Element): boolean {
   const tag = el.tagName.toLowerCase()
-  if (tag === 'select' || tag === 'textarea' || tag === 'button') return false
+  if (tag === 'select' || tag === 'textarea') return false
 
-  // Non-input element with combobox/listbox role → definitely custom
-  if (tag !== 'input') {
-    const role = el.getAttribute('role')
-    if (role === 'combobox' || role === 'listbox') return true
-    if (el.hasAttribute('aria-haspopup')) return true
-  }
+  // Explicit ARIA combobox/listbox roles (any tag)
+  const role = el.getAttribute('role')
+  if (role === 'combobox' || role === 'listbox') return true
 
-  // Input that is read-only inside a styled container → custom select
+  // Elements with aria-haspopup (dropdown triggers regardless of tag)
+  if (el.hasAttribute('aria-haspopup')) return true
+
+  // Elements with aria-expanded (open/close state = definitely a dropdown)
+  if (el.hasAttribute('aria-expanded')) return true
+
+  // Read-only input inside styled dropdown container
   if (tag === 'input' && (el as HTMLInputElement).readOnly) {
     return !!(
       el.closest('[role="combobox"]') ||
       el.closest('[aria-haspopup]') ||
+      el.closest('[aria-expanded]') ||
       el.closest('[class*="select"]') ||
       el.closest('[class*="Select"]') ||
       el.closest('[class*="dropdown"]') ||
@@ -182,86 +184,158 @@ function isCustomDropdown(el: Element): boolean {
     )
   }
 
-  return false
-}
-
-// Clicks a custom dropdown container, waits for options to render, clicks the match.
-async function fillCustomDropdown(el: Element, value: string): Promise<boolean> {
-  // Find the best trigger element (the visible clickable part of the dropdown)
-  const container =
-    el.closest('[role="combobox"]') ??
-    el.closest('[aria-haspopup]') ??
-    el.closest('[class*="select"]') ??
-    el.closest('[class*="Select"]') ??
-    el.parentElement ??
-    el
-
-  const trigger = (
-    (container !== el && isVisible(container) ? container : null) ??
-    el
-  ) as HTMLElement
-
-  // Open the dropdown
-  trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
-  trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
-  trigger.click()
-  trigger.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
-
-  await delay(450)
-
-  const needle = value.toLowerCase().trim()
-  const OPTION_SEL = [
-    '[role="option"]',
-    '[role="menuitem"]',
-    '[class*="option"]',
-    '[class*="Option"]',
-    '[class*="item"]',
-    'li',
-  ].join(',')
-
-  // 1. Search near the trigger first (less likely to hit a different open dropdown)
-  const nearAncestor =
-    trigger.closest('[role="listbox"]') ??
-    trigger.parentElement?.querySelector('[role="listbox"]') ??
-    trigger.parentElement?.parentElement?.querySelector('[role="listbox"]') ??
-    trigger.parentElement
-
-  if (nearAncestor) {
-    for (const opt of Array.from(nearAncestor.querySelectorAll<HTMLElement>(OPTION_SEL))) {
-      if (!isVisible(opt)) continue
-      const txt = opt.textContent?.trim().toLowerCase() ?? ''
-      const dataVal = (opt.getAttribute('data-value') ?? '').toLowerCase()
-      if (txt === needle || txt.includes(needle) || dataVal === needle) {
-        opt.click()
-        console.log(`[CS] ✓ Custom dropdown (nearby): "${opt.textContent?.trim()}"`)
-        await delay(150)
-        return true
-      }
+  // Button inside a dropdown/select container (Workable pattern)
+  if (tag === 'button' || tag === 'div' || tag === 'span') {
+    const container =
+      el.closest('[class*="select"]') ??
+      el.closest('[class*="Select"]') ??
+      el.closest('[class*="dropdown"]') ??
+      el.closest('[class*="Dropdown"]') ??
+      el.closest('[data-automation*="select"]')
+    if (container && container !== el) {
+      // Only if this element looks like the trigger (has current value text or down-arrow)
+      const txt = el.textContent?.trim() ?? ''
+      if (txt && txt.length < 100) return true
     }
   }
 
-  // 2. Global scan for any visible option matching the value
-  for (const opt of Array.from(document.querySelectorAll<HTMLElement>(OPTION_SEL))) {
-    if (!isVisible(opt)) continue
+  return false
+}
+
+// Returns the best clickable trigger element for a custom dropdown.
+function findDropdownTrigger(el: Element): HTMLElement {
+  const tag = el.tagName.toLowerCase()
+
+  // Walk up to find the nearest container that controls the dropdown
+  const container =
+    el.closest('[aria-haspopup]') ??
+    el.closest('[aria-expanded]') ??
+    el.closest('[role="combobox"]') ??
+    el.closest('[class*="select"]') ??
+    el.closest('[class*="Select"]') ??
+    el.closest('[class*="dropdown"]') ??
+    el.closest('[class*="Dropdown"]') ??
+    el.parentElement ??
+    el
+
+  // Prefer a button inside the container (common pattern)
+  const innerBtn = container !== el
+    ? container.querySelector<HTMLElement>('button, [role="button"]')
+    : null
+  if (innerBtn && isVisible(innerBtn)) return innerBtn
+
+  // Prefer the container itself if it's visible and not just the root
+  if (container !== el && isVisible(container as Element)) return container as HTMLElement
+
+  // Fall back to the element itself
+  if (tag === 'input') {
+    // For read-only inputs, the parent div is usually the trigger
+    const parent = el.parentElement
+    if (parent && isVisible(parent)) return parent
+  }
+
+  return el as HTMLElement
+}
+
+// Clicks a custom dropdown, waits for options to appear, clicks the matching option.
+async function fillCustomDropdown(el: Element, value: string): Promise<boolean> {
+  const trigger = findDropdownTrigger(el)
+  const needle = value.toLowerCase().trim()
+
+  const OPTION_SEL = [
+    '[role="option"]',
+    '[role="menuitem"]',
+    'li[data-value]',
+    'li[data-id]',
+    '[class*="option"][class*="item"]',
+    '[class*="Option"]',
+    '[class*="menu-item"]',
+    '[class*="MenuItem"]',
+    'li',
+  ].join(',')
+
+  // Snapshot of visible listboxes BEFORE opening (to detect portal appearance)
+  const listboxesBefore = new Set(
+    Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [class*="dropdown__menu"], [class*="select__menu"]'))
+      .filter(isVisible)
+  )
+
+  // Open the dropdown with multiple event strategies
+  trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+  trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }))
+  trigger.click()
+  trigger.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
+  trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+
+  await delay(600)
+
+  // Find newly appeared option containers (portal pattern)
+  const newListboxes = Array.from(
+    document.querySelectorAll<HTMLElement>('[role="listbox"], [role="menu"], [class*="dropdown__menu"], [class*="select__menu"], [class*="options-list"], [class*="OptionsList"]')
+  ).filter(el => isVisible(el) && !listboxesBefore.has(el))
+
+  // Helper: try to pick the best matching option from a container
+  function pickOption(container: Element): boolean {
+    const opts = Array.from(container.querySelectorAll<HTMLElement>(OPTION_SEL))
+    for (const opt of opts) {
+      if (!isVisible(opt)) continue
+      const txt = opt.textContent?.trim().toLowerCase() ?? ''
+      const dataVal = (
+        opt.getAttribute('data-value') ??
+        opt.getAttribute('data-id') ??
+        opt.getAttribute('value') ?? ''
+      ).toLowerCase()
+      if (txt === needle || txt.includes(needle) || needle.includes(txt) || dataVal === needle) {
+        opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+        opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+        opt.click()
+        console.log(`[CS] ✓ Custom dropdown (${container === document.body ? 'global' : 'local'}): "${opt.textContent?.trim()}"`)
+        return true
+      }
+    }
+    return false
+  }
+
+  // 1. Newly appeared portal listboxes (highest confidence)
+  for (const box of newListboxes) {
+    if (pickOption(box)) { await delay(150); return true }
+  }
+
+  // 2. Nearby ancestor (traditional non-portal)
+  const nearAncestor =
+    trigger.closest('[role="listbox"]') ??
+    trigger.closest('[role="menu"]') ??
+    trigger.parentElement?.querySelector('[role="listbox"]') ??
+    trigger.parentElement?.parentElement?.querySelector('[role="listbox"]') ??
+    trigger.parentElement?.parentElement?.querySelector('[class*="options"]') ??
+    trigger.parentElement
+  if (nearAncestor && pickOption(nearAncestor)) { await delay(150); return true }
+
+  // 3. Global fallback — any visible option in the entire document
+  const allOpts = Array.from(document.querySelectorAll<HTMLElement>(OPTION_SEL))
+    .filter(isVisible)
+  for (const opt of allOpts) {
     const txt = opt.textContent?.trim().toLowerCase() ?? ''
-    const dataVal = (opt.getAttribute('data-value') ?? '').toLowerCase()
-    if (txt === needle || txt.includes(needle) || dataVal === needle) {
+    const dataVal = (opt.getAttribute('data-value') ?? opt.getAttribute('data-id') ?? '').toLowerCase()
+    if (txt === needle || txt.includes(needle) || needle.includes(txt) || dataVal === needle) {
+      opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+      opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
       opt.click()
-      console.log(`[CS] ✓ Custom dropdown (global): "${opt.textContent?.trim()}"`)
+      console.log(`[CS] ✓ Custom dropdown (doc-wide): "${opt.textContent?.trim()}"`)
       await delay(150)
       return true
     }
   }
 
-  // Close the dropdown if nothing matched
+  // Close if nothing matched
   trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
   console.warn(`[CS] Custom dropdown: no option matching "${value}"`)
   return false
 }
 
 // ── Phone field helpers ────────────────────────────────────────────────────────
 
-// True when a phone text input is part of a split field (country selector + number).
 function hasCountrySelector(el: Element): boolean {
   const parent = el.parentElement
   const ancestor = el.closest('[class*="phone"], [class*="Phone"], [class*="tel"], .iti')
@@ -277,7 +351,6 @@ function hasCountrySelector(el: Element): boolean {
   )
 }
 
-// Strip leading country code (+1, +44, +234 …) from a phone string.
 function stripCountryCode(phone: string): string {
   return phone
     .replace(/^\+\d{1,3}[-\s]?/, '')   // +XX or +XXX
@@ -285,15 +358,40 @@ function stripCountryCode(phone: string): string {
     .trim()
 }
 
+// ── Resume upload ──────────────────────────────────────────────────────────────
+
+async function uploadResume(input: HTMLInputElement): Promise<boolean> {
+  try {
+    const url = chrome.runtime.getURL('public/cverai.resume.pdf')
+    const res = await fetch(url)
+    if (!res.ok) { console.warn('[CS] Resume fetch failed:', res.status); return false }
+    const blob = await res.blob()
+    const file = new File([blob], 'John_Doe_Resume.pdf', { type: 'application/pdf' })
+    const dt = new DataTransfer()
+    dt.items.add(file)
+    input.files = dt.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    console.log('[CS] ✓ Resume uploaded to file input')
+    return true
+  } catch (e) {
+    console.warn('[CS] Resume upload error:', e)
+    return false
+  }
+}
+
 // ── Fill element ───────────────────────────────────────────────────────────────
 
-// Returns true on success, false on failure, 'custom' when async dropdown handling is needed.
+// Returns true on success, false on failure, 'custom' for async dropdown handling.
 function fillElement(el: Element, value: string): boolean | 'custom' {
   const tag = el.tagName.toLowerCase()
   const type = el.getAttribute('type')?.toLowerCase()
 
   // Custom dropdown — caller must use fillCustomDropdown() instead
   if (isCustomDropdown(el)) return 'custom'
+
+  // File upload — handled separately in the FILL_AND_SUBMIT async block
+  if (type === 'file') return false
 
   let filled = false
 
@@ -382,11 +480,11 @@ function resolveElement(instr: FillInstruction): Element | null {
         const el = document.getElementById(forId)
         if (el) return el
       }
-      const nested = lbl.querySelector('input, select, textarea, [role="combobox"]')
+      const nested = lbl.querySelector('input, select, textarea, [role="combobox"], [aria-haspopup]')
       if (nested) return nested
     }
-    // Also try matching by placeholder or aria-label on inputs
-    for (const el of qAll('input, select, textarea, [role="combobox"]')) {
+    // Match by placeholder / aria-label / name on any form-like element
+    for (const el of qAll('input, select, textarea, [role="combobox"], [aria-haspopup], [aria-expanded]')) {
       const lbl2 = getLabel(el).toLowerCase().replace(/[*\s]+/g, ' ').trim()
       if (lbl2 && (lbl2.includes(needle) || needle.includes(lbl2))) return el
     }
@@ -435,12 +533,13 @@ function getUnfilledRequired(): UnfilledField[] {
     }
   }
 
-  // Custom combobox / dropdown components (read-only inputs or role=combobox divs)
-  for (const el of qAll('[role="combobox"], input[readonly]')) {
+  // Custom dropdowns: role=combobox, aria-haspopup, or read-only inputs inside styled containers
+  const CUSTOM_SEL = '[role="combobox"], [aria-haspopup], input[readonly]'
+  for (const el of qAll(CUSTOM_SEL)) {
     if (!isVisible(el)) continue
     if (!isRequiredEl(el)) continue
     const val = (el as HTMLInputElement).value?.trim() ?? el.textContent?.trim() ?? ''
-    if (!val || val.toLowerCase().startsWith('select')) {
+    if (!val || val.toLowerCase().startsWith('select') || val.toLowerCase() === 'choose') {
       const id = el.getAttribute('id') || undefined
       const name = el.getAttribute('name') || undefined
       add({ label: getLabel(el), name, id, type: 'custom_select' })
@@ -485,6 +584,48 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const type = message.type as string
   console.log(`[CS] Message: ${type}`)
 
+  // ── EXPAND_PROFILE_SECTIONS ──────────────────────────────────────────────────
+  // Clicks "Add Education" / "Add Experience" / "Add" buttons inside profile sections
+  // so their form fields become visible before scanning.
+  if (type === 'EXPAND_PROFILE_SECTIONS') {
+    ;(async () => {
+      const ADD_SECTION_RE =
+        /^\+?\s*(add\s+education|add\s+experience|add\s+work\s+experience|add\s+qualification|add\s+another|add\s+new|add)\s*$/i
+
+      const buttons = Array.from(
+        document.querySelectorAll<HTMLElement>('button, [role="button"], a')
+      ).filter((el) => {
+        if (!isVisible(el)) return false
+        const txt = el.textContent?.trim() ?? ''
+        return ADD_SECTION_RE.test(txt)
+      })
+
+      let expanded = 0
+      for (const btn of buttons) {
+        // Only click if the section doesn't already have visible inputs
+        const section =
+          btn.closest('section') ??
+          btn.closest('[class*="section"]') ??
+          btn.closest('[class*="profile"]') ??
+          btn.parentElement?.parentElement
+        const alreadyOpen = section
+          ? section.querySelector('input:not([type="hidden"]), textarea, select') !== null &&
+            Array.from(section.querySelectorAll<HTMLInputElement>('input:not([type="hidden"])')).some(isVisible)
+          : false
+        if (!alreadyOpen) {
+          console.log(`[CS] Expanding section: "${btn.textContent?.trim()}"`)
+          btn.click()
+          expanded++
+          await delay(400)
+        }
+      }
+      if (expanded > 0) await delay(300) // extra settle time
+      sendResponse({ expanded })
+    })()
+    return true
+  }
+
+  // ── GET_JOB_ELEMENTS ─────────────────────────────────────────────────────────
   if (type === 'GET_JOB_ELEMENTS') {
     console.log('[CS] Scanning...')
 
@@ -537,6 +678,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .filter((el) => !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(el.tagName))
       .map((el) => info(el))
 
+    // Custom dropdowns: elements with aria-haspopup or aria-expanded that act as select triggers
+    const customSelects = qAll('[aria-haspopup], [aria-expanded]')
+      .filter((el) => {
+        if (!['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName) === false) return false
+        if (!isVisible(el)) return false
+        // Exclude if it's just a regular button (e.g. Apply Now)
+        const txt = el.textContent?.trim() ?? ''
+        if (APPLY_RE.test(txt) || CONTINUE_RE.test(txt) || FINAL_SUBMIT_RE.test(txt)) return false
+        return true
+      })
+      .map((el) => {
+        const currentVal = (el as HTMLInputElement).value?.trim() || el.textContent?.trim() || ''
+        return info(el, { value: currentVal || undefined })
+      })
+
     const hiddenInputs: HiddenInput[] = qAll('input[type="hidden"]').map((el) => ({
       name: (el as HTMLInputElement).name || '',
       id: el.getAttribute('id') ?? undefined,
@@ -546,7 +702,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const categories = {
       textFields, dateFields, fileUploads, checkboxes, radios,
       dropdowns, textareas, buttons, navigationLinks, applyButtons, richTextEditors,
-      customComponents, hiddenInputs,
+      customComponents, customSelects, hiddenInputs,
     }
     const totals = Object.fromEntries(Object.entries(categories).map(([k, v]) => [k, v.length]))
 
@@ -560,8 +716,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     })
   }
 
+  // ── FILL_AND_SUBMIT ───────────────────────────────────────────────────────────
   if (type === 'FILL_AND_SUBMIT') {
-    // Async handler — return true below keeps the channel open until sendResponse is called.
     ;(async () => {
       const fills = (message.fills ?? []) as FillInstruction[]
       const submitForm = message.submitForm !== false
@@ -571,7 +727,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       let filledCount = 0
       const customQueue: { el: Element; value: string; label: string; source: string }[] = []
 
-      // ── Sync fill pass ─────────────────────────────────────────────────────
+      // ── 0. Upload resume to any visible file input ──────────────────────────
+      const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'))
+        .filter(isVisible)
+      for (const fi of fileInputs) {
+        const ok = await uploadResume(fi)
+        if (ok) {
+          filledCount++
+          report.push({ label: getLabel(fi) || 'Resume', value: 'cverai.resume.pdf', source: 'demo_user', status: 'filled' })
+        }
+      }
+
+      // ── 1. Sync fill pass ──────────────────────────────────────────────────
       for (const instr of fills) {
         const el = resolveElement(instr)
         const labelKey = instr.label ?? instr.name ?? instr.id ?? '?'
@@ -585,10 +752,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const result = fillElement(el, instr.value)
 
         if (result === 'custom') {
-          // Queue for async click-based fill
           customQueue.push({ el, value: instr.value, label: labelKey, source: instr.source ?? 'unknown' })
           report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: 'async' })
-          filledCount++ // optimistic; will be corrected below if it fails
+          filledCount++ // optimistic; corrected below if it fails
         } else if (result) {
           console.log(`[CS] ✓ "${labelKey}" = "${instr.value}" [${instr.source ?? '?'}]`)
           report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: 'filled' })
@@ -599,26 +765,44 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
       }
 
-      // ── Async custom dropdown pass ──────────────────────────────────────────
+      // ── 2. Async custom dropdown pass ────────────────────────────────────
       if (customQueue.length > 0) {
         console.log(`[CS] Async custom dropdown fills: ${customQueue.length}`)
         for (const item of customQueue) {
           const ok = await fillCustomDropdown(item.el, item.value)
+          const entry = report.find((r) => r.label === item.label && r.status === 'async')
           if (!ok) {
-            // Mark as failed in the report
-            const entry = report.find((r) => r.label === item.label && r.status === 'async')
             if (entry) { entry.status = 'failed'; filledCount-- }
           } else {
-            const entry = report.find((r) => r.label === item.label && r.status === 'async')
             if (entry) entry.status = 'filled'
             console.log(`[CS] ✓ Custom dropdown "${item.label}" = "${item.value}"`)
           }
         }
-        // Give React a moment to update state before scanning for unfilled fields
         await delay(300)
       }
 
-      // ── Scan for still-unfilled required fields ────────────────────────────
+      // ── 3. Click section-level Save buttons (Education/Experience entries) ──
+      // These are "Save" buttons inside profile sections (not the main form action).
+      const SECTION_SAVE_RE = /^(save|done|add entry|save entry)$/i
+      const sectionSaveBtns = Array.from(
+        document.querySelectorAll<HTMLElement>('button:not([type="submit"])')
+      ).filter((el) => {
+        if (!isVisible(el)) return false
+        const txt = el.textContent?.trim() ?? ''
+        if (!SECTION_SAVE_RE.test(txt)) return false
+        if (CONTINUE_RE.test(txt) || FINAL_SUBMIT_RE.test(txt)) return false
+        // Only inside a section that also has visible inputs (it's a subsection, not main form)
+        const ancestor = el.closest('section, [class*="section"], [class*="profile"], [class*="entry"], div')
+        return !!(ancestor && ancestor.querySelector('input:not([type="hidden"]), textarea'))
+      })
+      for (const btn of sectionSaveBtns) {
+        console.log(`[CS] Clicking section save: "${btn.textContent?.trim()}"`)
+        btn.click()
+        await delay(300)
+      }
+
+      // ── 4. Scan still-unfilled required fields ──────────────────────────────
+      await delay(200) // let React settle after section saves
       const unfilledRequired = getUnfilledRequired()
       if (unfilledRequired.length > 0) {
         console.log(`[CS] Unfilled required (${unfilledRequired.length}):`, unfilledRequired.map((f) => f.label))
@@ -630,7 +814,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         console.log(`[CS] Action button: ${action ? `"${action.btn.textContent?.trim()}" isFinal=${action.isFinal}` : 'not found'}`)
       }
 
-      // Send report BEFORE clicking — clicking may cause navigation
       sendResponse({
         filled: filledCount,
         submitted: action?.isFinal ?? false,
@@ -648,8 +831,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }, 200)
       }
     })()
+    return true
   }
 
+  // ── CLICK_BUTTON ─────────────────────────────────────────────────────────────
   if (type === 'CLICK_BUTTON') {
     const text = (message.buttonText ?? '') as string
     const APPLY_RE = /\b(apply|apply now|apply for this job|start application|begin application)\b/i
