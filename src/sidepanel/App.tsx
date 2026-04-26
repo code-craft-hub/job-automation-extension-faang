@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -147,20 +147,26 @@ async function callGemini(apiKey: string, data: JobData): Promise<Decision> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts: [{ text: buildPrompt(data) }] }],
+        generationConfig: { responseMimeType: "application/json" },
       }),
     },
   );
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({})) as { error?: { message?: string } };
+    const err = (await res.json().catch(() => ({}))) as {
+      error?: { message?: string };
+    };
     throw new Error(err?.error?.message ?? `Gemini API error ${res.status}`);
   }
 
-  const json = await res.json() as {
-    candidates?: { content?: { parts?: { text?: string }[] } }[]
+  const json = (await res.json()) as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
   };
-  const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("Empty response from Gemini");
+  const raw = json.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!raw) throw new Error("Empty response from Gemini");
+
+  // Strip markdown code fences if Gemini ignores responseMimeType
+  const text = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
 
   try {
     return JSON.parse(text) as Decision;
@@ -177,12 +183,29 @@ export default function App() {
   const [decision, setDecision] = useState<Decision | null>(null);
   const [loading, setLoading] = useState(false);
   const [actionDone, setActionDone] = useState("");
+  const [logs, setLogs] = useState<string[]>([]);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+
+  function log(msg: string) {
+    const entry = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    console.log("[SP]", msg);
+    setLogs((prev) => [...prev, entry]);
+  }
+
+  // Auto-scroll logs to bottom
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
 
   useEffect(() => {
+    log("Side panel mounted");
     chrome.storage.local.get("geminiApiKey", (result) => {
       if (result.geminiApiKey) {
         setApiKey(result.geminiApiKey as string);
         setStatus("API key loaded. Click Analyze to scan this page.");
+        log("API key loaded from storage");
+      } else {
+        log("No API key in storage");
       }
     });
   }, []);
@@ -190,36 +213,86 @@ export default function App() {
   function saveKey(key: string) {
     setApiKey(key);
     chrome.storage.local.set({ geminiApiKey: key });
+    log("API key saved to storage");
   }
 
   async function analyze() {
     if (!apiKey.trim()) {
       setStatus("Please enter a Gemini API key first.");
+      log("Analyze blocked: no API key");
       return;
     }
     setLoading(true);
     setDecision(null);
     setActionDone("");
+    log("Analyze started");
 
     try {
       setStatus("Scanning page elements...");
+      log("→ Sending GET_JOB_ELEMENTS to background...");
+
       const elements = await new Promise<JobData>((resolve, reject) => {
         chrome.runtime.sendMessage({ type: "GET_JOB_ELEMENTS" }, (response) => {
-          if (chrome.runtime.lastError)
-            return reject(new Error(chrome.runtime.lastError.message));
-          if (response?.error) return reject(new Error(response.error as string));
+          if (chrome.runtime.lastError) {
+            const msg = chrome.runtime.lastError.message ?? "Unknown error";
+            log(`✗ Runtime error: ${msg}`);
+            if (msg.includes("Receiving end does not exist")) {
+              return reject(
+                new Error(
+                  "Content script not found on this tab.\n→ Reload the page (F5) and try again.\n→ Only works on https:// pages.",
+                ),
+              );
+            }
+            return reject(new Error(msg));
+          }
+          if (response?.error) {
+            const msg = response.error as string;
+            log(`✗ Response error: ${msg}`);
+            if (msg.includes("Receiving end does not exist")) {
+              return reject(
+                new Error(
+                  "Content script not found on this tab.\n→ Reload the page (F5) and try again.\n→ Only works on https:// pages.",
+                ),
+              );
+            }
+            return reject(new Error(msg));
+          }
           resolve(response as JobData);
         });
       });
 
+      const totals = Object.entries(elements.totals)
+        .filter(([, v]) => v > 0)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(", ");
+      log(`← Elements received — ${totals}`);
+      log(`   Page: "${elements.title}" (${elements.url})`);
+
       setStatus("Sending to Gemini...");
+      log("→ Calling Gemini API...");
+
       const result = await callGemini(apiKey, elements);
+      log(`← Gemini decision: ${result.action.toUpperCase()} — ${result.reason}`);
+
+      if (result.action === "fill") {
+        log(`   ${result.fills.length} field(s) to fill:`);
+        result.fills.forEach((f) => {
+          const key = f.name ? `name="${f.name}"` : `id="${f.id}"`;
+          log(`   ${key} = "${f.value}"`);
+        });
+      } else {
+        log(`   URL: ${result.url}`);
+      }
+
       setDecision(result);
       setStatus(`Gemini decided: ${result.action.toUpperCase()}`);
     } catch (err) {
-      setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`✗ Error: ${msg}`);
+      setStatus(`Error: ${msg}`);
     } finally {
       setLoading(false);
+      log("Analyze complete");
     }
   }
 
@@ -227,19 +300,25 @@ export default function App() {
     if (!decision) return;
 
     if (decision.action === "fill") {
+      log(`→ Sending FILL_FORM (${decision.fills.length} fields)...`);
       chrome.runtime.sendMessage(
         { type: "FILL_FORM", fills: decision.fills },
         (response) => {
           if (chrome.runtime.lastError) {
-            setActionDone(`Error: ${chrome.runtime.lastError.message}`);
+            const msg = chrome.runtime.lastError.message ?? "Unknown error";
+            log(`✗ Fill error: ${msg}`);
+            setActionDone(`Error: ${msg}`);
             return;
           }
           const r = response as { filled?: number };
+          log(`← Fill result: ${r?.filled ?? 0} field(s) filled`);
           setActionDone(`Filled ${r?.filled ?? 0} field(s).`);
         },
       );
     } else {
+      log(`→ Sending NAVIGATE to: ${decision.url}`);
       chrome.runtime.sendMessage({ type: "NAVIGATE", url: decision.url }, () => {
+        log("← Navigate sent");
         setActionDone(`Navigating to: ${decision.url}`);
       });
     }
@@ -287,10 +366,39 @@ export default function App() {
             {decision.action === "fill" ? "Fill Form" : "Navigate"}
           </button>
         )}
+        {logs.length > 0 && (
+          <button onClick={() => setLogs([])} style={{ marginLeft: "auto" }}>
+            Clear logs
+          </button>
+        )}
       </div>
       <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", margin: 0 }}>
         {lines.join("\n")}
       </pre>
+      {logs.length > 0 && (
+        <div
+          style={{
+            marginTop: "10px",
+            borderTop: "1px solid #555",
+            paddingTop: "6px",
+          }}
+        >
+          <div style={{ opacity: 0.6, marginBottom: "4px" }}>── LOGS ──</div>
+          <pre
+            style={{
+              fontSize: "10px",
+              margin: 0,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+              maxHeight: "200px",
+              overflowY: "auto",
+            }}
+          >
+            {logs.join("\n")}
+            <div ref={logsEndRef} />
+          </pre>
+        </div>
+      )}
     </div>
   );
 }
