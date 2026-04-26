@@ -42,7 +42,7 @@ const JOB_LINK_RE =
   /\b(apply|application|job|career|position|opening|vacancy|hiring|recruit|join.?us|work.?with.?us|opportunities)\b/i
 
 const FINAL_SUBMIT_RE =
-  /\b(submit|finish|done|submit application|send application|complete application|submit now)\b/i
+  /\b(submit|finish|done|(?:submit|send|complete)\s+(?:my\s+|your\s+|the\s+)?(?:application|application\s+form)|submit\s+now|send\s+now)\b/i
 
 const CONTINUE_RE =
   /\b(continue|next|next step|save and continue|save & continue|proceed|go to next)\b/i
@@ -150,32 +150,58 @@ function getPageText(): string {
   return container.innerText.replace(/\s+/g, ' ').trim().slice(0, 3000)
 }
 
-function findActionButton(): { btn: HTMLElement; isFinal: boolean } | null {
-  // Include role="button" elements — SPAs (SmartRecruiters, Greenhouse, etc.) use divs/spans as buttons
-  const candidates = Array.from(
-    document.querySelectorAll<HTMLElement>('button, input[type="submit"], input[type="button"], [role="button"]'),
-  ).filter(isVisible)
+// Walk open shadow roots to find additional elements (anti-bot pages may move buttons into shadow DOM).
+function queryShadow(selector: string): HTMLElement[] {
+  const found: HTMLElement[] = []
+  function walk(root: Document | ShadowRoot) {
+    root.querySelectorAll<HTMLElement>(selector).forEach((el) => found.push(el))
+    root.querySelectorAll('*').forEach((el) => {
+      if ((el as HTMLElement).shadowRoot) walk((el as HTMLElement).shadowRoot!)
+    })
+  }
+  walk(document)
+  return found
+}
+
+// Get the best visible text label from a button element.
+function btnText(btn: HTMLElement): string {
+  return (
+    btn.textContent?.trim() ||
+    btn.getAttribute('aria-label')?.trim() ||
+    (btn as HTMLInputElement).value ||
+    ''
+  )
+}
+
+function findActionButton(): { btn: HTMLElement; text: string; isFinal: boolean } | null {
+  const SEL = 'button, input[type="submit"], input[type="button"], [role="button"]'
+
+  // Regular DOM + shadow DOM
+  const candidates = [
+    ...Array.from(document.querySelectorAll<HTMLElement>(SEL)),
+    ...queryShadow(SEL).filter((el) => !document.contains(el)),
+  ].filter((el) => {
+    if (!isVisible(el)) return false
+    // Include aria-hidden buttons — some SPAs hide buttons from a11y but keep them clickable
+    return true
+  })
 
   let finalBtn: HTMLElement | null = null
   let continueBtn: HTMLElement | null = null
 
   for (const btn of candidates) {
-    // aria-label as fallback for icon-only buttons where textContent is empty
-    const text = btn.textContent?.trim()
-      || btn.getAttribute('aria-label')?.trim()
-      || (btn as HTMLInputElement).value
-      || ''
+    const text = btnText(btn)
     if (!continueBtn && CONTINUE_RE.test(text)) continueBtn = btn
     if (!finalBtn && FINAL_SUBMIT_RE.test(text)) finalBtn = btn
   }
 
-  if (finalBtn) return { btn: finalBtn, isFinal: true }
-  if (continueBtn) return { btn: continueBtn, isFinal: false }
+  if (finalBtn) return { btn: finalBtn, text: btnText(finalBtn), isFinal: true }
+  if (continueBtn) return { btn: continueBtn, text: btnText(continueBtn), isFinal: false }
 
   const explicit = candidates.find(
-    (b) => b.getAttribute('type') === 'submit' && !CONTINUE_RE.test(b.textContent?.trim() ?? ''),
+    (b) => b.getAttribute('type') === 'submit' && !CONTINUE_RE.test(btnText(b)),
   )
-  return explicit ? { btn: explicit, isFinal: true } : null
+  return explicit ? { btn: explicit, text: btnText(explicit), isFinal: true } : null
 }
 
 // ── Custom dropdown detection ──────────────────────────────────────────────────
@@ -1075,13 +1101,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     const totals = Object.fromEntries(Object.entries(categories).map(([k, v]) => [k, v.length]))
 
-    console.log('[CS] Scan complete:', totals)
+    // Detect action button during scan so the side panel can log it immediately
+    const scannedAction = findActionButton()
+    const detectedActionButton = scannedAction
+      ? { text: scannedAction.text, isFinal: scannedAction.isFinal }
+      : null
+
+    console.log('[CS] Scan complete:', totals, '| action button:', detectedActionButton?.text ?? 'none')
     sendResponse({
       url: window.location.href,
       title: document.title,
       pageText: getPageText(),
       categories,
       totals,
+      detectedActionButton,
     })
     })() // end async IIFE
     return true
@@ -1185,11 +1218,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       const action = submitForm ? findActionButton() : null
 
-      // Block final submit when required fields are still unfilled.
-      // (Continue buttons are allowed — server-side validation will show errors.)
-      const failedRequired = report.filter(r => r.status === 'failed' || r.status === 'not_found')
-      const hasUnfilledRequired = unfilledRequired.length > 0 || failedRequired.length > 0
-      const shouldBlock = action?.isFinal && hasUnfilledRequired
+      // Only block the FINAL submit when the DOM scan still sees empty required fields.
+      // Failed fills for optional fields should NOT prevent submission.
+      // Continue buttons are never blocked — server validation will handle errors.
+      const shouldBlock = action?.isFinal && unfilledRequired.length > 0
       const effectiveAction = shouldBlock ? null : action
 
       if (shouldBlock) {
@@ -1197,14 +1229,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
 
       const pageAction = effectiveAction ? (effectiveAction.isFinal ? 'submitted' : 'continued') : 'none'
+      const actionButtonText = action?.text ?? null
       if (submitForm) {
-        console.log(`[CS] Action button: ${effectiveAction ? `"${effectiveAction.btn.textContent?.trim()}" isFinal=${effectiveAction.isFinal}` : shouldBlock ? 'BLOCKED (unfilled required)' : 'not found'}`)
+        console.log(`[CS] Action button: ${action ? `"${action.text}" isFinal=${action.isFinal}` : 'not found'}${shouldBlock ? ' → BLOCKED' : ''}`)
       }
 
       sendResponse({
         filled: filledCount,
         submitted: effectiveAction?.isFinal ?? false,
         pageAction,
+        actionButtonText,
         report,
         url: window.location.href,
         title: document.title,

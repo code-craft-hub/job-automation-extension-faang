@@ -18,6 +18,7 @@ type JobData = {
   title: string;
   pageText?: string;
   totals: Record<string, number>;
+  detectedActionButton?: { text: string; isFinal: boolean } | null;
   categories: {
     textFields: FieldInfo[];
     dateFields: FieldInfo[];
@@ -69,6 +70,7 @@ type SubmitResult = {
   filled: number;
   submitted: boolean;
   pageAction: "submitted" | "continued" | "none";
+  actionButtonText?: string | null;
   report: FillReportItem[];
   url: string;
   title: string;
@@ -500,6 +502,12 @@ Respond with ONLY a valid JSON array, no markdown:
       const visibleCount = countVisibleInputs(elements);
       log(`← ${totals}`);
       log(`   Visible inputs: ${visibleCount}`);
+      if (elements.detectedActionButton) {
+        const btn = elements.detectedActionButton;
+        log(`   Action button: "${btn.text}" (${btn.isFinal ? "FINAL SUBMIT" : "continue/next"})`);
+      } else {
+        log(`   Action button: none detected`);
+      }
 
       log("→ Asking Gemini...");
       const decision = await callGemini(apiKey, elements);
@@ -582,6 +590,13 @@ Respond with ONLY a valid JSON array, no markdown:
 
         // ── Submit: re-fill everything + click submit/continue ────────────────────
         const result = await doFillAndSubmit(allFills);
+
+        // Always log the action button the content script found (or didn't)
+        if (result.actionButtonText) {
+          log(`← Action button clicked: "${result.actionButtonText}"`);
+        } else {
+          log(`← No action button found on page (check browser console for details)`);
+        }
 
         if (result.pageAction === "continued") {
           if (continueCountRef.current >= MAX_CONTINUE) {
