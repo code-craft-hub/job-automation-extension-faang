@@ -88,6 +88,20 @@ function getLabel(el: Element): string {
     parent = parent.parentElement
   }
 
+  // Sibling-label pattern: label/span is a preceding sibling of the field wrapper
+  // (common in React form libs where <Label> and <Input> are siblings in a <div>)
+  let scope: Element | null = el.parentElement
+  for (let depth = 0; depth < 4 && scope; depth++) {
+    for (const child of Array.from(scope.children)) {
+      if (child === el || child.contains(el)) break // stop at the field itself
+      if (!['LABEL', 'LEGEND', 'H3', 'H4', 'H5', 'SPAN', 'DIV', 'P'].includes(child.tagName)) continue
+      if (child.querySelector('input,select,textarea,button,[role="combobox"],[aria-haspopup]')) continue
+      const txt = child.textContent?.trim() ?? ''
+      if (txt.length > 0 && txt.length < 100) return txt
+    }
+    scope = scope.parentElement
+  }
+
   return get('placeholder') || get('name') || get('title') || get('id')
 }
 
@@ -137,15 +151,20 @@ function getPageText(): string {
 }
 
 function findActionButton(): { btn: HTMLElement; isFinal: boolean } | null {
+  // Include role="button" elements — SPAs (SmartRecruiters, Greenhouse, etc.) use divs/spans as buttons
   const candidates = Array.from(
-    document.querySelectorAll<HTMLElement>('button, input[type="submit"], input[type="button"]'),
+    document.querySelectorAll<HTMLElement>('button, input[type="submit"], input[type="button"], [role="button"]'),
   ).filter(isVisible)
 
   let finalBtn: HTMLElement | null = null
   let continueBtn: HTMLElement | null = null
 
   for (const btn of candidates) {
-    const text = btn.textContent?.trim() || (btn as HTMLInputElement).value || ''
+    // aria-label as fallback for icon-only buttons where textContent is empty
+    const text = btn.textContent?.trim()
+      || btn.getAttribute('aria-label')?.trim()
+      || (btn as HTMLInputElement).value
+      || ''
     if (!continueBtn && CONTINUE_RE.test(text)) continueBtn = btn
     if (!finalBtn && FINAL_SUBMIT_RE.test(text)) finalBtn = btn
   }
@@ -664,6 +683,10 @@ function findYesNoButton(questionLabel: string, answer: 'yes' | 'no'): HTMLEleme
 
 // ── Resolve element ────────────────────────────────────────────────────────────
 
+// Tracks which custom dropdowns have already been claimed by positional fallback
+// so that two empty-label fills don't both resolve to the first dropdown.
+const _positionalClaimed = new Set<Element>()
+
 function resolveElement(instr: FillInstruction): Element | null {
   // YES/NO boolean buttons — special path before generic resolution
   if (instr.value && /^(yes|no)$/i.test(instr.value) && instr.label) {
@@ -681,9 +704,9 @@ function resolveElement(instr: FillInstruction): Element | null {
     const el = document.getElementById(instr.id)
     if (el) return el
   }
-  // Label-text fallback
-  if (instr.label) {
-    const needle = instr.label.toLowerCase().replace(/[*\s]+/g, ' ').trim()
+  // Label-text fallback (guard against empty needle)
+  const needle = (instr.label ?? '').toLowerCase().replace(/[*\s]+/g, ' ').trim()
+  if (needle) {
     for (const lbl of Array.from(document.querySelectorAll<HTMLElement>('label'))) {
       const t = (lbl.textContent ?? '').toLowerCase().replace(/[*\s]+/g, ' ').trim()
       if (!t || (!t.includes(needle) && !needle.includes(t))) continue
@@ -701,7 +724,27 @@ function resolveElement(instr: FillInstruction): Element | null {
       if (lbl2 && (lbl2.includes(needle) || needle.includes(lbl2))) return el
     }
   }
+
+  // Positional fallback: fill has no label/name/id (e.g. SmartRecruiters unlabeled dropdowns)
+  // Claim the next unclaimed visible custom dropdown in DOM order.
+  if (!needle && !instr.name && !instr.id && isCustomDropdown_value(instr.value)) {
+    for (const el of qAll('[aria-haspopup], [aria-expanded], [role="combobox"], input[readonly]')) {
+      if (!isVisible(el) || !isCustomDropdown(el)) continue
+      if (_positionalClaimed.has(el)) continue
+      _positionalClaimed.add(el)
+      return el
+    }
+  }
+
   return null
+}
+
+// Returns true if the value looks like a dropdown selection (not a free-text answer).
+function isCustomDropdown_value(val: string): boolean {
+  if (!val) return false
+  // Short values (1-4 words) with title-cased words are likely dropdown options
+  const words = val.trim().split(/\s+/)
+  return words.length <= 5 && words.every(w => /^[A-Z]/.test(w) || /^[0-9]/.test(w))
 }
 
 // ── Unfilled required fields scan ─────────────────────────────────────────────
@@ -1047,6 +1090,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // ── FILL_AND_SUBMIT ───────────────────────────────────────────────────────────
   if (type === 'FILL_AND_SUBMIT') {
     ;(async () => {
+      // Reset positional dropdown claim tracker for this fill cycle
+      _positionalClaimed.clear()
+
       const fills = (message.fills ?? []) as FillInstruction[]
       const submitForm = message.submitForm !== false
       console.log(`[CS] FILL_AND_SUBMIT: ${fills.length} fills, submitForm=${submitForm}`)
