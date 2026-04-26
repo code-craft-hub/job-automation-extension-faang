@@ -681,8 +681,31 @@ function fillElement(el: Element, value: string): boolean | 'custom' {
       return t === needle || t.includes(needle) || needle.includes(t)
     })
     if (target) {
-      clickOption(target)
-      console.log(`[CS] ✓ ARIA radio "${getLabel(el)}": "${target.textContent?.trim()}"`)
+      // Focus first — required for keyboard-driven ARIA implementations
+      try { target.focus() } catch { /* noop */ }
+
+      // Google Forms wraps each [role="radio"] inside a <label> element.
+      // The label's click handler is what actually selects the option and
+      // updates aria-checked. Clicking the radio div alone may be silently ignored.
+      const labelParent = target.closest('label') as HTMLElement | null
+      // Also check the [data-value] container (outer nWQGrd div in Google Forms)
+      const dataValueParent = target.closest('[data-value]') as HTMLElement | null
+
+      // Click in order: label → data-value container → the radio div itself
+      if (labelParent) {
+        clickOption(labelParent)
+      } else if (dataValueParent) {
+        clickOption(dataValueParent)
+      } else {
+        clickOption(target)
+      }
+
+      // Keyboard Space fallback — Google Forms and other ARIA radio implementations
+      // listen for Space/Enter keydown to toggle selection.
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, bubbles: true, cancelable: true }))
+      target.dispatchEvent(new KeyboardEvent('keyup',  { key: ' ', code: 'Space', keyCode: 32, bubbles: true }))
+
+      console.log(`[CS] ✓ ARIA radio "${getLabel(el)}": "${target.getAttribute('aria-label') ?? target.textContent?.trim()}"`)
       return true
     }
     console.warn(`[CS] ARIA radiogroup "${getLabel(el)}": no option matching "${value}"`)
@@ -849,6 +872,43 @@ function fillElement(el: Element, value: string): boolean | 'custom' {
       }
     }
     console.log(`[CS] ✓ Radio "${name ?? 'unnamed'}": matched "${target.value || value}"`)
+    filled = true
+
+  } else if (type === 'date' || type === 'datetime-local') {
+    // Native date inputs require value in YYYY-MM-DD (or YYYY-MM-DDTHH:MM for datetime-local).
+    // Convert common human-readable formats before setting.
+    const MONTHS: Record<string, string> = {
+      january:'01', february:'02', march:'03', april:'04', may:'05', june:'06',
+      july:'07', august:'08', september:'09', october:'10', november:'11', december:'12',
+    }
+    let dateVal = value.trim()
+
+    // MM/DD/YYYY  →  YYYY-MM-DD
+    const mdy = dateVal.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+    if (mdy) dateVal = `${mdy[3]}-${mdy[1].padStart(2, '0')}-${mdy[2].padStart(2, '0')}`
+
+    // DD-MM-YYYY  →  YYYY-MM-DD
+    const dmy = dateVal.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/)
+    if (dmy) dateVal = `${dmy[3]}-${dmy[1].padStart(2, '0')}-${dmy[2].padStart(2, '0')}`
+
+    // "Month DD, YYYY" / "DD Month YYYY"  →  YYYY-MM-DD
+    const longMDY = dateVal.match(/^([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})$/)
+    if (longMDY) {
+      const m = MONTHS[longMDY[1].toLowerCase()]
+      if (m) dateVal = `${longMDY[3]}-${m}-${longMDY[2].padStart(2, '0')}`
+    }
+    const longDMY = dateVal.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/)
+    if (longDMY) {
+      const m = MONTHS[longDMY[2].toLowerCase()]
+      if (m) dateVal = `${longDMY[3]}-${m}-${longDMY[1].padStart(2, '0')}`
+    }
+
+    const dateInput = el as HTMLInputElement
+    const dateSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    dateSetter?.call(dateInput, dateVal)
+    dateInput.dispatchEvent(new Event('input', { bubbles: true }))
+    dateInput.dispatchEvent(new Event('change', { bubbles: true }))
+    console.log(`[CS] ✓ Date input "${getLabel(el)}": "${dateVal}"`)
     filled = true
 
   } else if (tag === 'textarea') {
@@ -1098,6 +1158,21 @@ function getUnfilledRequired(): UnfilledField[] {
     const name = el.getAttribute('name') || undefined
     const id = el.getAttribute('id') || undefined
     if (name || id) add({ label: getLabel(el), name, id, type: 'invalid' })
+  }
+
+  // Google Forms file-upload questions (Drive picker — not a standard <input type="file">).
+  // These are required fields the bot can never fill; surface them as type:"gforms_file_upload"
+  // so the side panel can detect the infinite-loop condition and stop gracefully.
+  if (/docs\.google\.com\/forms/i.test(window.location.href)) {
+    for (const el of qAll('[class*="freebirdFormviewerComponentsQuestionFileRoot"], [data-item-type="FILE_UPLOAD"]')) {
+      if (!isVisible(el)) continue
+      if (!isRequiredEl(el)) continue
+      // Check if already has a file (Drive picker fills a hidden list with file names)
+      const hasFile = !!(el.querySelector('[class*="fileListItem"], [class*="fileName"]'))
+      if (!hasFile) {
+        add({ label: getLabel(el) || 'File upload', type: 'gforms_file_upload' })
+      }
+    }
   }
 
   // YES/NO boolean button pairs that have not been answered

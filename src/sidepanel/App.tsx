@@ -101,6 +101,7 @@ const DEMO_USER = {
   yearsExperience: "5",
   skills: "JavaScript, TypeScript, React, Node.js, Python",
   salaryExpectation: "120000",
+  dateOfBirth: "1990-01-15",
   noticePeriod: "2 weeks",
   workAuthorized: "Yes",
   requiresSponsorship: "No",
@@ -231,6 +232,7 @@ TASK — decide ONE action:
 2. "fill" — if the page is clearly part of a job application (any form step):
    - Fill EVERY visible form field. Nothing should be skipped or left empty.
    - textFields / textareas: match demo user data (source:"demo_user"); generate concise relevant answers for unmatched fields (source:"ai_generated").
+   - dateFields: MUST include a fill instruction for EACH date field. Use DEMO_USER.dateOfBirth when the field asks for date of birth/birthday. Value MUST be in YYYY-MM-DD format (e.g. "1990-01-15"). NEVER use MM/DD/YYYY, "January 15, 1990", or any other format.
    - customSelects: MUST include a fill instruction for EACH custom select. Pick the most appropriate value for the context (e.g. for "Qualification" choose a degree level like "Master's Degree"; for "Areas of Expertise" choose the most relevant expertise). Match by label. The extension will click-open and auto-select the option.
    - dropdowns (native): pick the most appropriate non-placeholder option.
    - radioGroups: pick one option value. For YES/NO questions, pick "yes".
@@ -667,6 +669,19 @@ Respond with ONLY a valid JSON array, no markdown:
 
         } else if (result.pageAction === "none" && (result.unfilledRequired?.length ?? 0) > 0) {
           // Submit was blocked or produced validation errors — re-scan to retry.
+          // Exception: Google Forms file-upload fields use the Drive picker and can never be
+          // filled by a content script. If that's the only remaining issue, stop the loop.
+          const unfillable = result.unfilledRequired!.filter((f) => f.type === "gforms_file_upload");
+          const fillable   = result.unfilledRequired!.filter((f) => f.type !== "gforms_file_upload");
+
+          if (unfillable.length > 0 && fillable.length === 0) {
+            setPhase("done");
+            isRunningRef.current = false;
+            log(`⚠ All other fields filled. The form has a required Google Drive file upload which cannot be automated — please attach your CV manually then submit.`);
+            for (const f of unfillable) log(`   [file] "${f.label}"`);
+            return;
+          }
+
           log(`← Submit failed — ${result.unfilledRequired!.length} issue(s). Re-scanning...`);
           for (const f of result.unfilledRequired!) {
             log(`   [!] "${f.label}" (${f.type}${f.options?.length ? ": " + f.options.slice(0, 5).join(" | ") : ""})`);
