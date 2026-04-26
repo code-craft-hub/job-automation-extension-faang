@@ -30,6 +30,14 @@ type FillReport = {
   status: 'filled' | 'failed' | 'not_found'
 }
 
+type UnfilledField = {
+  label: string
+  name?: string
+  id?: string
+  type: string
+  options?: string[]
+}
+
 const JOB_LINK_RE =
   /\b(apply|application|job|career|position|opening|vacancy|hiring|recruit|join.?us|work.?with.?us|opportunities)\b/i
 
@@ -91,6 +99,12 @@ function isVisible(el: Element): boolean {
   }
 }
 
+function isRequiredEl(el: Element): boolean {
+  if (el.hasAttribute('required') || el.getAttribute('aria-required') === 'true') return true
+  // Many ATS (Workable etc.) mark required with * in the label text
+  return /\*/.test(getLabel(el))
+}
+
 function info(el: Element, extra: Partial<ElementInfo> = {}): ElementInfo {
   return {
     tag: el.tagName.toLowerCase(),
@@ -98,7 +112,7 @@ function info(el: Element, extra: Partial<ElementInfo> = {}): ElementInfo {
     label: getLabel(el),
     name: el.getAttribute('name') ?? undefined,
     id: el.getAttribute('id') ?? undefined,
-    required: el.hasAttribute('required') || el.getAttribute('aria-required') === 'true',
+    required: isRequiredEl(el),
     visible: isVisible(el),
     ...extra,
   }
@@ -142,6 +156,7 @@ function findActionButton(): { btn: HTMLElement; isFinal: boolean } | null {
 function fillElement(el: Element, value: string): boolean {
   const tag = el.tagName.toLowerCase()
   const type = el.getAttribute('type')?.toLowerCase()
+  let filled = false
 
   if (tag === 'select') {
     const sel = el as HTMLSelectElement
@@ -154,11 +169,13 @@ function fillElement(el: Element, value: string): boolean {
     const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set
     setter?.call(sel, option.value)
     sel.dispatchEvent(new Event('change', { bubbles: true }))
+    filled = true
 
   } else if (type === 'checkbox') {
     const cb = el as HTMLInputElement
     const shouldCheck = ['true', '1', 'yes', 'checked', 'on'].includes(value.toLowerCase())
     if (cb.checked !== shouldCheck) cb.click()
+    filled = true
 
   } else if (type === 'radio') {
     const name = el.getAttribute('name')
@@ -169,6 +186,7 @@ function fillElement(el: Element, value: string): boolean {
         ).find((r) => r.value.toLowerCase() === value.toLowerCase())
         if (!target) { console.warn(`[CS] No radio value="${value}" in group="${name}"`); return false }
         if (!target.checked) target.click()
+        filled = true
       } catch { return false }
     }
 
@@ -178,6 +196,7 @@ function fillElement(el: Element, value: string): boolean {
     setter?.call(ta, value)
     ta.dispatchEvent(new Event('input', { bubbles: true }))
     ta.dispatchEvent(new Event('change', { bubbles: true }))
+    filled = true
 
   } else {
     const input = el as HTMLInputElement
@@ -185,9 +204,16 @@ function fillElement(el: Element, value: string): boolean {
     setter?.call(input, value)
     input.dispatchEvent(new Event('input', { bubbles: true }))
     input.dispatchEvent(new Event('change', { bubbles: true }))
+    filled = true
   }
 
-  return true
+  // Trigger validation events so the form framework knows the field was touched
+  if (filled) {
+    el.dispatchEvent(new Event('blur', { bubbles: true }))
+    el.dispatchEvent(new Event('focusout', { bubbles: true }))
+  }
+
+  return filled
 }
 
 function resolveElement(instr: FillInstruction): Element | null {
@@ -197,8 +223,101 @@ function resolveElement(instr: FillInstruction): Element | null {
       if (el) return el
     } catch { /* noop */ }
   }
-  if (instr.id) return document.getElementById(instr.id)
+  if (instr.id) {
+    const el = document.getElementById(instr.id)
+    if (el) return el
+  }
+  // Label-text fallback — finds the associated form control for a matching label
+  if (instr.label) {
+    const needle = instr.label.toLowerCase().replace(/[*\s]+/g, ' ').trim()
+    for (const lbl of Array.from(document.querySelectorAll<HTMLElement>('label'))) {
+      const t = (lbl.textContent ?? '').toLowerCase().replace(/[*\s]+/g, ' ').trim()
+      if (!t || (!t.includes(needle) && !needle.includes(t))) continue
+      const forId = lbl.getAttribute('for')
+      if (forId) {
+        const el = document.getElementById(forId)
+        if (el) return el
+      }
+      const nested = lbl.querySelector('input, select, textarea')
+      if (nested) return nested
+    }
+  }
   return null
+}
+
+// Returns all required form fields that are still empty or in an error state.
+function getUnfilledRequired(): UnfilledField[] {
+  const result: UnfilledField[] = []
+  const seen = new Set<string>()
+
+  function add(f: UnfilledField) {
+    const key = f.name ?? f.id ?? f.label
+    if (seen.has(key)) return
+    seen.add(key)
+    result.push(f)
+  }
+
+  // Text / email / tel / textarea
+  const TEXT_SEL = [
+    'input[type="text"]', 'input[type="email"]', 'input[type="tel"]',
+    'input[type="number"]', 'input[type="url"]', 'input:not([type])', 'textarea',
+  ].join(',')
+  for (const el of qAll(TEXT_SEL)) {
+    if (!isVisible(el)) continue
+    const inp = el as HTMLInputElement | HTMLTextAreaElement
+    if (isRequiredEl(el) && !inp.value.trim()) {
+      add({
+        label: getLabel(el),
+        name: inp.name || undefined,
+        id: inp.id || undefined,
+        type: el.tagName.toLowerCase() === 'textarea' ? 'textarea' : ((inp as HTMLInputElement).type || 'text'),
+      })
+    }
+  }
+
+  // Selects
+  for (const el of qAll('select')) {
+    if (!isVisible(el)) continue
+    const sel = el as HTMLSelectElement
+    if (isRequiredEl(el) && (!sel.value || sel.selectedIndex <= 0)) {
+      const options = Array.from(sel.options)
+        .slice(1)
+        .map((o) => o.value || o.text.trim())
+        .filter(Boolean)
+      add({ label: getLabel(el), name: sel.name || undefined, id: sel.id || undefined, type: 'select', options })
+    }
+  }
+
+  // Radio groups — report once per group
+  const radioGroups = new Map<string, HTMLInputElement[]>()
+  for (const el of qAll('input[type="radio"]')) {
+    const r = el as HTMLInputElement
+    if (!r.name) continue
+    if (!radioGroups.has(r.name)) radioGroups.set(r.name, [])
+    radioGroups.get(r.name)!.push(r)
+  }
+  for (const [name, radios] of radioGroups) {
+    if (!radios.some((r) => isVisible(r))) continue
+    if (!radios.some((r) => isRequiredEl(r))) continue
+    if (radios.some((r) => r.checked)) continue
+    add({
+      label: getLabel(radios[0]),
+      name,
+      id: undefined,
+      type: 'radio',
+      options: [...new Set(radios.map((r) => r.value).filter(Boolean))],
+    })
+  }
+
+  // Fields in error state (aria-invalid)
+  for (const el of qAll('[aria-invalid="true"]')) {
+    if (!isVisible(el)) continue
+    const name = el.getAttribute('name') || undefined
+    const id = el.getAttribute('id') || undefined
+    if (name || id) add({ label: getLabel(el), name, id, type: 'invalid' })
+  }
+
+  return result
 }
 
 // ── Message listener ───────────────────────────────────────────────────────────
@@ -284,7 +403,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (type === 'FILL_AND_SUBMIT') {
     const fills = (message.fills ?? []) as FillInstruction[]
-    console.log(`[CS] FILL_AND_SUBMIT: ${fills.length} instructions`)
+    const submitForm = message.submitForm !== false  // default: true
+    console.log(`[CS] FILL_AND_SUBMIT: ${fills.length} instructions, submitForm=${submitForm}`)
     const report: FillReport[] = []
     let filledCount = 0
 
@@ -308,9 +428,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
     }
 
-    const action = findActionButton()
+    // Scan for required fields still empty/errored after filling
+    const unfilledRequired = getUnfilledRequired()
+    if (unfilledRequired.length > 0) {
+      console.log(`[CS] Unfilled required fields (${unfilledRequired.length}):`, unfilledRequired.map(f => f.label))
+    }
+
+    const action = submitForm ? findActionButton() : null
     const pageAction = action ? (action.isFinal ? 'submitted' : 'continued') : 'none'
-    console.log(`[CS] Action button: ${action ? `<${action.btn.tagName.toLowerCase()}> "${action.btn.textContent?.trim()}" isFinal=${action.isFinal}` : 'not found'}`)
+    if (submitForm) {
+      console.log(`[CS] Action button: ${action ? `"${action.btn.textContent?.trim()}" isFinal=${action.isFinal}` : 'not found'}`)
+    }
 
     // Send report BEFORE clicking — clicking may cause page navigation
     sendResponse({
@@ -320,6 +448,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       report,
       url: window.location.href,
       title: document.title,
+      unfilledRequired,
     })
 
     if (action) {

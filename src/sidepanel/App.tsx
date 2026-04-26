@@ -55,6 +55,14 @@ type FillReportItem = {
   status: string;
 };
 
+type UnfilledField = {
+  label: string;
+  name?: string;
+  id?: string;
+  type: string;
+  options?: string[];
+};
+
 type SubmitResult = {
   filled: number;
   submitted: boolean;
@@ -62,6 +70,7 @@ type SubmitResult = {
   report: FillReportItem[];
   url: string;
   title: string;
+  unfilledRequired?: UnfilledField[];
 };
 
 // ── Demo user ──────────────────────────────────────────────────────────────────
@@ -112,6 +121,15 @@ function countVisibleInputs(data: JobData): number {
 function buildPrompt(data: JobData): string {
   const visible = (f: FieldInfo) => f.visible !== false;
 
+  // Group radios by name — filter huge groups (phone country codes = 90+ options)
+  const radioGroupMap: Record<string, { label: string; name: string; required?: boolean; options: string[] }> = {};
+  for (const f of data.categories.radios.filter(visible)) {
+    const key = f.name ?? "_";
+    if (!radioGroupMap[key]) radioGroupMap[key] = { label: f.label, name: key, required: f.required, options: [] };
+    if (f.value && !radioGroupMap[key].options.includes(f.value)) radioGroupMap[key].options.push(f.value);
+  }
+  const radioGroups = Object.values(radioGroupMap).filter((g) => g.options.length <= 8);
+
   const summary = {
     url: data.url,
     title: data.title,
@@ -120,19 +138,13 @@ function buildPrompt(data: JobData): string {
       textFields: data.categories.textFields.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
       dateFields: data.categories.dateFields.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id })),
       fileUploads: data.categories.fileUploads.filter(visible).map((f) => ({ label: f.label, name: f.name, accept: f.value })),
-      checkboxes: data.categories.checkboxes.filter(visible).map((f) => ({ label: f.label, name: f.name })),
-      radios: data.categories.radios.filter(visible).map((f) => ({ label: f.label, name: f.name, value: f.value })),
-      dropdowns: data.categories.dropdowns.filter(visible).map((f) => ({ label: f.label, name: f.name, options: f.options?.slice(0, 8) })),
+      checkboxes: data.categories.checkboxes.filter(visible).map((f) => ({ label: f.label, name: f.name, required: f.required })),
+      radioGroups,
+      dropdowns: data.categories.dropdowns.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required, options: f.options?.slice(0, 12) })),
       textareas: data.categories.textareas.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
     },
-    applyButtons: data.categories.applyButtons.map((f) => ({
-      text: f.value,
-      href: f.href ?? null,
-    })),
-    navigationLinks: data.categories.navigationLinks.map((f) => ({
-      text: f.value,
-      href: f.href,
-    })),
+    applyButtons: data.categories.applyButtons.map((f) => ({ text: f.value, href: f.href ?? null })),
+    navigationLinks: data.categories.navigationLinks.map((f) => ({ text: f.value, href: f.href })),
   };
 
   return `You are a job application assistant.
@@ -154,15 +166,13 @@ TASK — decide ONE action:
    - If you see the same applyButtons repeatedly and button count has grown (dropdown opened), still return "click" — the extension will route to the correct dropdown item.
 
 2. "fill" — if the page is clearly part of a job application process (any step of a multi-page form):
-   - Standard form page (totalVisibleInputs > 0): fill the fields.
-     * Map demo user data to matching fields (source: "demo_user")
-     * For open-ended questions (e.g. "Why do you want this role?", skills assessments), generate a realistic answer from the job context (source: "ai_generated")
-     * Every fill: name or id, label, value, source
-     * CRITICAL — Checkboxes: ALWAYS include every checkbox in your fills array.
-       - Terms, conditions, consent, privacy, agreement checkboxes → value: "true" (must be checked to proceed)
-       - Opt-in/marketing checkboxes → value: "false" (leave unchecked unless required)
-       - When in doubt, check it (value: "true") so the form can be submitted.
-   - Review/confirmation page (totalVisibleInputs = 0 but page shows entered data or a final Submit button): return fills:[] (empty array). The extension will click the Submit button automatically.
+   - Fill EVERY visible form field. Nothing should be skipped or left empty.
+   - textFields / textareas: match to demo user data where possible (source:"demo_user"); generate a short, relevant answer for unmatched fields (source:"ai_generated").
+   - radioGroups: for each group pick one option value. For YES/NO-style questions, pick "yes" (or the affirmative option) for skills/qualifications questions.
+   - dropdowns: pick the most appropriate option from the options list. For required dropdowns, ALWAYS pick a non-placeholder value.
+   - checkboxes: Terms/consent/privacy → value:"true". Marketing opt-in → value:"false". When in doubt, value:"true".
+   - Every fill instruction must include: name OR id, label, value, source.
+   - Review/confirmation page (totalVisibleInputs=0 but shows a Submit button): return fills:[] — the extension clicks Submit automatically.
 
 3. "navigate" — ONLY if this is a pure job listing/description page with NO applyButtons and NO application form visible.
    - Choose the best URL from navigationLinks that leads toward an application form.
@@ -170,7 +180,7 @@ TASK — decide ONE action:
 
 Key rules:
 - applyButtons non-empty → always "click"
-- Any page that is a step of a job application form (including review/upload/personal info pages) → always "fill"
+- Any page with a form (any step) → always "fill" every single field
 - Pure listing page with no form and no applyButtons → "navigate"
 
 Respond with ONLY valid JSON, no markdown:
@@ -343,7 +353,7 @@ export default function App() {
 
   function doFillAndSubmit(fills: FillInstruction[]): Promise<SubmitResult> {
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type: "FILL_AND_SUBMIT", fills }, (response) => {
+      chrome.runtime.sendMessage({ type: "FILL_AND_SUBMIT", fills, submitForm: true }, (response) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message ?? "Unknown"));
           return;
@@ -353,6 +363,67 @@ export default function App() {
         resolve(r);
       });
     });
+  }
+
+  // Fill fields without clicking the submit/continue button — used for pass 1.
+  function doFillFields(fills: FillInstruction[]): Promise<SubmitResult> {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: "FILL_AND_SUBMIT", fills, submitForm: false }, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message ?? "Unknown"));
+          return;
+        }
+        const r = response as { error?: string } & SubmitResult;
+        if (r.error) { reject(new Error(r.error)); return; }
+        resolve(r);
+      });
+    });
+  }
+
+  // Ask Gemini specifically for fill values for fields that are still empty/required.
+  async function callGeminiForRemaining(fields: UnfilledField[], pageText: string): Promise<FillInstruction[]> {
+    const prompt = `You are a job application assistant. These required form fields are still empty after the initial fill pass. Generate ONE fill value for EACH field.
+
+JOB PAGE CONTEXT:
+${pageText || "(not available)"}
+
+DEMO USER DATA:
+${JSON.stringify(DEMO_USER, null, 2)}
+
+UNFILLED REQUIRED FIELDS:
+${JSON.stringify(fields, null, 2)}
+
+Rules:
+- radio (options list given): pick the most appropriate option value from the options array. For YES/NO questions, choose "yes" (the affirmative).
+- select (options list given): pick the most appropriate non-empty option value.
+- textarea / text: generate a concise, relevant answer based on the job context and demo user data.
+- invalid: re-supply the correct value — something went wrong with the previous fill.
+- ALWAYS include name or id in each instruction (use what was provided).
+- source must be "ai_generated".
+
+Respond with ONLY a valid JSON array, no markdown:
+[{"name":"field_name","id":"field_id","label":"Field Label","value":"chosen value","source":"ai_generated"}, ...]`;
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      },
+    );
+    if (!res.ok) {
+      const err = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+      throw new Error(err?.error?.message ?? `Gemini API error ${res.status}`);
+    }
+    const json = (await res.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+    const raw = json.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!raw) throw new Error("Empty response from Gemini (remaining fields)");
+    const text = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+    return JSON.parse(text) as FillInstruction[];
   }
 
   // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -407,17 +478,38 @@ export default function App() {
         }, 3000);
 
       } else {
+        // ── Pass 1: fill Gemini's fields (no submit yet, triggers validation) ──────
         if (decision.fills.length > 0) {
-          log(`→ Filling ${decision.fills.length} field(s)...`);
+          log(`→ Filling ${decision.fills.length} field(s) — pass 1...`);
           for (const f of decision.fills) {
             const tag = f.source === "ai_generated" ? "[AI]" : "[demo]";
             log(`   ${tag} "${f.label ?? f.name ?? f.id}" = "${f.value}"`);
           }
         } else {
-          log("→ Review page detected — looking for Submit button...");
+          log("→ Review page — scanning for unfilled required fields...");
         }
 
-        const result = await doFillAndSubmit(decision.fills);
+        const pass1 = await doFillFields(decision.fills);
+        const unfilled = pass1.unfilledRequired ?? [];
+
+        // ── Pass 2: generate values for still-empty required fields ───────────────
+        let allFills = [...decision.fills];
+        if (unfilled.length > 0) {
+          log(`→ ${unfilled.length} required field(s) still empty after pass 1:`);
+          for (const f of unfilled) {
+            log(`   [?] "${f.label}" (${f.type}${f.options?.length ? ": " + f.options.join(" | ") : ""})`);
+          }
+          log("→ Asking Gemini to generate values for remaining fields...");
+          const additionalFills = await callGeminiForRemaining(unfilled, elements.pageText ?? "");
+          log(`← Generated ${additionalFills.length} additional fill(s)`);
+          for (const f of additionalFills) {
+            log(`   [AI] "${f.label ?? f.name ?? f.id}" = "${f.value}"`);
+          }
+          allFills = [...allFills, ...additionalFills];
+        }
+
+        // ── Submit: re-fill everything + click submit/continue ────────────────────
+        const result = await doFillAndSubmit(allFills);
 
         if (result.pageAction === "continued") {
           if (continueCountRef.current >= MAX_CONTINUE) {
