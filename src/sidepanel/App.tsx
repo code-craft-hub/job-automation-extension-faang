@@ -49,7 +49,8 @@ type FillInstruction = {
 type Decision =
   | { action: "fill"; reason: string; fills: FillInstruction[] }
   | { action: "navigate"; reason: string; url: string }
-  | { action: "click"; reason: string; buttonText: string };
+  | { action: "click"; reason: string; buttonText: string }
+  | { action: "done"; reason: string };
 
 type FillReportItem = {
   label: string;
@@ -221,15 +222,21 @@ TASK — decide ONE action:
 3. "navigate" — ONLY if pure listing page with NO applyButtons and NO form visible.
    - Use a real URL from navigationLinks. NEVER invent a URL.
 
+4. "done" — ONLY if the current page is a confirmation/thank-you page proving the application was received.
+   - Look for text like "Thank you for applying", "Application submitted", "Application received", "We've received your application", "You've successfully applied", etc.
+   - Do NOT return "done" just because a submit button was clicked — wait for an explicit confirmation message.
+
 Key rules:
 - applyButtons non-empty → always "click"
 - Any page with a form → always "fill" every single visible field including all customSelects
 - Pure listing with no form and no applyButtons → "navigate"
+- Confirmation/thank-you page → always "done"
 
 Respond with ONLY valid JSON, no markdown:
 Fill: {"action":"fill","reason":"...","fills":[{"label":"Qualification","value":"Master's Degree","source":"demo_user"},{"label":"Areas of Expertise Sought","value":"Software Engineering","source":"ai_generated"},...]}
 Click: {"action":"click","reason":"...","buttonText":"Apply now"}
-Navigate: {"action":"navigate","reason":"...","url":"https://..."}`;
+Navigate: {"action":"navigate","reason":"...","url":"https://..."}
+Done: {"action":"done","reason":"Application confirmed — page shows 'Thank you for applying'"}`;
 }
 
 async function callGemini(apiKey: string, data: JobData): Promise<Decision> {
@@ -557,7 +564,14 @@ Respond with ONLY a valid JSON array, no markdown:
           }, 3000);
         }
 
+      } else if (decision.action === "done") {
+        // ── Application confirmed submitted ──────────────────────────────────────
+        setPhase("done");
+        isRunningRef.current = false;
+        log(`✓ ${decision.reason}`);
+
       } else {
+        // decision.action === "fill"
         // ── Pass 1: fill Gemini's fields (no submit yet, triggers validation) ──────
         if (decision.fills.length > 0) {
           log(`→ Filling ${decision.fills.length} field(s) — pass 1...`);
@@ -613,10 +627,23 @@ Respond with ONLY a valid JSON array, no markdown:
             }
           }, 3500);
 
+        } else if (result.pageAction === "submitted") {
+          // Submit button was clicked and no validation errors detected.
+          // Keep the loop running — wait for the page to navigate to the confirmation page.
+          // Gemini will return "done" when it sees the thank-you content.
+          log(`→ Submit clicked — waiting for confirmation page...`);
+          chrome.runtime.sendMessage({ type: "WATCH_CURRENT_TAB" });
+          clickFallbackTimerRef.current = setTimeout(() => {
+            clickFallbackTimerRef.current = null;
+            if (isRunningRef.current) {
+              log("← Re-scanning to verify submission...");
+              runCycleRef.current?.();
+            }
+          }, 3500);
+
         } else if (result.pageAction === "none" && (result.unfilledRequired?.length ?? 0) > 0) {
-          // Submit was blocked because required fields are still unfilled.
-          // Re-scan immediately so the next cycle sees the fresh dropdown states.
-          log(`← Submit blocked — ${result.unfilledRequired!.length} required field(s) still unfilled. Re-scanning...`);
+          // Submit was blocked or produced validation errors — re-scan to retry.
+          log(`← Submit failed — ${result.unfilledRequired!.length} issue(s). Re-scanning...`);
           for (const f of result.unfilledRequired!) {
             log(`   [!] "${f.label}" (${f.type}${f.options?.length ? ": " + f.options.slice(0, 5).join(" | ") : ""})`);
           }
@@ -629,11 +656,7 @@ Respond with ONLY a valid JSON array, no markdown:
           setSubmitResult(result);
           setPhase("done");
           isRunningRef.current = false;
-          if (result.submitted) {
-            log(`✓ Application submitted! Filled ${result.filled} field(s) across ${continueCountRef.current + 1} page(s).`);
-          } else {
-            log(`✓ Done (no submit button found). Filled ${result.filled} field(s).`);
-          }
+          log(`✓ Done (no submit button found). Filled ${result.filled} field(s).`);
         }
       }
     } catch (err) {

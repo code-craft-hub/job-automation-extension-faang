@@ -1134,9 +1134,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       let filledCount = 0
       const customQueue: { el: Element; value: string; label: string; source: string }[] = []
 
-      // ── 0. Upload resume to any visible file input ──────────────────────────
+      // ── 0. Upload resume to file inputs ────────────────────────────────────
+      // File inputs are always CSS-hidden on modern job boards (triggered by a styled button).
+      // Do NOT filter by isVisible — only filter by isResumeInput to skip photo/logo fields.
       const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'))
-        .filter(isVisible)
         .filter(isResumeInput)
       for (const fi of fileInputs) {
         const ok = await uploadResume(fi)
@@ -1228,28 +1229,79 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         console.warn(`[CS] Blocking submit — ${unfilledRequired.length} required field(s) still empty`)
       }
 
-      const pageAction = effectiveAction ? (effectiveAction.isFinal ? 'submitted' : 'continued') : 'none'
       const actionButtonText = action?.text ?? null
       if (submitForm) {
         console.log(`[CS] Action button: ${action ? `"${action.text}" isFinal=${action.isFinal}` : 'not found'}${shouldBlock ? ' → BLOCKED' : ''}`)
       }
 
-      sendResponse({
-        filled: filledCount,
-        submitted: effectiveAction?.isFinal ?? false,
-        pageAction,
-        actionButtonText,
-        report,
-        url: window.location.href,
-        title: document.title,
-        unfilledRequired,
-      })
+      if (effectiveAction?.isFinal) {
+        // ── Final submit: click → wait → check for validation errors → respond ──
+        // Delay sendResponse until AFTER the error check so we can report failures accurately.
+        console.log('[CS] Clicking final submit...')
+        effectiveAction.btn.click()
+        await delay(800) // long enough for React validation, short enough before page unloads
 
-      if (effectiveAction) {
-        setTimeout(() => {
-          console.log(`[CS] Clicking ${effectiveAction.isFinal ? 'submit' : 'continue'}...`)
-          effectiveAction.btn.click()
-        }, 200)
+        const ERROR_SEL = [
+          '[aria-invalid="true"]',
+          '[role="alert"]',
+          '[class*="error"][class*="message"]',
+          '[class*="ErrorMessage"]',
+          '[class*="error-text"]',
+          '[class*="field-error"]',
+          '.error',
+        ].join(',')
+        const visibleErrors = Array.from(document.querySelectorAll<HTMLElement>(ERROR_SEL))
+          .filter((el) => isVisible(el) && (el.textContent?.trim() ?? '').length > 0)
+
+        if (visibleErrors.length > 0) {
+          const msgs = visibleErrors.map((e) => e.textContent!.trim().slice(0, 80))
+          console.warn('[CS] Submit validation errors:', msgs)
+          sendResponse({
+            filled: filledCount,
+            submitted: false,
+            pageAction: 'none' as const,
+            actionButtonText,
+            report,
+            url: window.location.href,
+            title: document.title,
+            unfilledRequired: [
+              ...unfilledRequired,
+              ...msgs.map((m) => ({ label: m, type: 'invalid' as const })),
+            ],
+          })
+        } else {
+          console.log('[CS] No validation errors — submit looks clean.')
+          sendResponse({
+            filled: filledCount,
+            submitted: true,
+            pageAction: 'submitted' as const,
+            actionButtonText,
+            report,
+            url: window.location.href,
+            title: document.title,
+            unfilledRequired,
+          })
+        }
+
+      } else {
+        // ── Continue or no action: respond immediately, then click ──────────────
+        const pageAction = effectiveAction ? 'continued' : 'none'
+        sendResponse({
+          filled: filledCount,
+          submitted: false,
+          pageAction: pageAction as 'continued' | 'none',
+          actionButtonText,
+          report,
+          url: window.location.href,
+          title: document.title,
+          unfilledRequired,
+        })
+        if (effectiveAction) {
+          setTimeout(() => {
+            console.log('[CS] Clicking continue...')
+            effectiveAction.btn.click()
+          }, 200)
+        }
       }
     })()
     return true
