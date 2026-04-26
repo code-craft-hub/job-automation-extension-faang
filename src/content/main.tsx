@@ -335,56 +335,90 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const APPLY_RE = /\b(apply|apply now|apply for this job|start application|begin application)\b/i
     const LINKEDIN_RE = /linkedin/i
 
-    const btn = [
-      ...Array.from(document.querySelectorAll<HTMLElement>('button')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
-      ...Array.from(document.querySelectorAll<HTMLElement>('a[href]')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
-    ].find((el) => !text || el.textContent?.trim().toLowerCase().includes(text.toLowerCase()))
+    // Strategy 1: many ATS sites embed the real apply href in the DOM before the dropdown
+    // is toggled open (the link is just hidden by CSS). Navigate directly — no clicking needed.
+    const directHref = (() => {
+      for (const a of Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))) {
+        const txt = (a.textContent?.trim() ?? '').replace(/[\s»›→»?⟩]+$/, '').trim()
+        const href = a.href ?? ''
+        if (!APPLY_RE.test(txt) || LINKEDIN_RE.test(txt)) continue
+        if (!href || href.endsWith('#') || href.startsWith('javascript') || href === window.location.href) continue
+        try {
+          const path = new URL(href).pathname
+          // Only accept if the path contains apply/application/candidate keywords
+          // OR the element is currently hidden (it's a dropdown-only link)
+          if (/apply|application|candidate|talentcommunity/i.test(path) || !isVisible(a)) {
+            return href
+          }
+        } catch { /* invalid URL — skip */ }
+      }
+      return null
+    })()
 
-    if (btn) {
+    if (directHref) {
+      console.log(`[CS] Direct apply href found — navigating: ${directHref}`)
       sendResponse({ clicked: true })
-      setTimeout(() => {
-        btn.click()
-        // If clicking opened a dropdown, auto-click the direct apply option (not LinkedIn)
-        setTimeout(() => {
-          const DROPDOWN_SEL = [
-            '[role="menu"]', '[role="listbox"]', '[role="dialog"]',
-            '.dropdown-menu', '.dropdown-content', '.popover',
-            '[class*="dropdown"]', '[class*="Dropdown"]',
-            '[class*="popup"]',  '[class*="Popup"]',
-            '[class*="menu"]',   '[class*="Menu"]',
-          ].join(',')
-
-          let target: HTMLElement | null = null
-
-          // Search inside visible dropdown containers first
-          for (const container of Array.from(document.querySelectorAll<HTMLElement>(DROPDOWN_SEL))) {
-            if (!isVisible(container)) continue
-            const item = Array.from(
-              container.querySelectorAll<HTMLElement>('a, button, li, [role="menuitem"], [role="option"]'),
-            ).find(
-              (el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn,
-            )
-            if (item) { target = item; break }
-          }
-
-          // Fallback: any newly visible apply link/button that isn't the toggle or LinkedIn
-          if (!target) {
-            target = [
-              ...Array.from(document.querySelectorAll<HTMLElement>('a[href]'))
-                .filter((el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn),
-              ...Array.from(document.querySelectorAll<HTMLElement>('button'))
-                .filter((el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn),
-            ][0] ?? null
-          }
-
-          if (target) {
-            console.log(`[CS] Auto-clicking dropdown apply item: "${target.textContent?.trim()}"`)
-            target.click()
-          }
-        }, 600)
-      }, 100)
+      setTimeout(() => { window.location.href = directHref }, 100)
     } else {
-      sendResponse({ clicked: false, error: 'Button not found' })
+      // Strategy 2: click the visible toggle and auto-click the dropdown item after it opens
+      const btn = [
+        ...Array.from(document.querySelectorAll<HTMLElement>('button')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
+        ...Array.from(document.querySelectorAll<HTMLElement>('a[href]')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
+      ].find((el) => !text || el.textContent?.trim().toLowerCase().includes(text.toLowerCase()))
+
+      if (btn) {
+        sendResponse({ clicked: true })
+        setTimeout(() => {
+          btn.click()
+          // After the click, detect if a dropdown opened and click the direct apply option
+          setTimeout(() => {
+            const DROPDOWN_SEL = [
+              '[role="menu"]', '[role="listbox"]', '[role="dialog"]',
+              '.dropdown-menu', '.dropdown-content', '.popover',
+              '[class*="dropdown"]', '[class*="Dropdown"]',
+              '[class*="popup"]', '[class*="Popup"]',
+              '[class*="menu"]', '[class*="Menu"]',
+            ].join(',')
+
+            let target: HTMLElement | null = null
+
+            // Search inside visible dropdown containers
+            for (const container of Array.from(document.querySelectorAll<HTMLElement>(DROPDOWN_SEL))) {
+              if (!isVisible(container)) continue
+              const item = Array.from(
+                container.querySelectorAll<HTMLElement>('a, button, li, [role="menuitem"], [role="option"]'),
+              ).find(
+                (el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn,
+              )
+              if (item) { target = item; break }
+            }
+
+            // Fallback: any newly visible apply link/button (not the toggle, not LinkedIn)
+            if (!target) {
+              target = [
+                ...Array.from(document.querySelectorAll<HTMLElement>('a[href]'))
+                  .filter((el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn),
+                ...Array.from(document.querySelectorAll<HTMLElement>('button'))
+                  .filter((el) => isVisible(el) && APPLY_RE.test(el.textContent ?? '') && !LINKEDIN_RE.test(el.textContent ?? '') && el !== btn),
+              ][0] ?? null
+            }
+
+            if (target) {
+              // Prefer navigating via href if target is a link, otherwise click
+              const targetHref = (target as HTMLAnchorElement).href
+              if (targetHref && !targetHref.endsWith('#') && !targetHref.startsWith('javascript')) {
+                console.log(`[CS] Dropdown apply link — navigating: ${targetHref}`)
+                window.location.href = targetHref
+              } else {
+                console.log(`[CS] Dropdown apply button — clicking: "${target.textContent?.trim()}"`)
+                target.click()
+              }
+            }
+          }, 600)
+        }, 100)
+      } else {
+        sendResponse({ clicked: false, error: 'Button not found' })
+      }
     }
   }
 
