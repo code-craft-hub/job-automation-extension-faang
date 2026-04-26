@@ -35,6 +35,8 @@ type JobData = {
     customSelects?: FieldInfo[];
     yesNoQuestions?: FieldInfo[];
     hiddenInputs: FieldInfo[];
+    ariaRadioGroups?: FieldInfo[];
+    ariaCheckboxGroups?: FieldInfo[];
   };
 };
 
@@ -151,6 +153,8 @@ function countVisibleInputs(data: JobData): number {
     ...data.categories.textareas,
     ...(data.categories.customSelects ?? []),
     ...(data.categories.yesNoQuestions ?? []),
+    ...(data.categories.ariaRadioGroups ?? []),
+    ...(data.categories.ariaCheckboxGroups ?? []),
   ].filter((f) => f.visible !== false).length;
 }
 
@@ -184,6 +188,16 @@ function buildPrompt(data: JobData): string {
       yesNoQuestions: (data.categories.yesNoQuestions ?? [])
         .filter(f => f.value !== 'answered') // skip already answered
         .map((f) => ({ label: f.label, required: f.required, options: ['yes', 'no'] })),
+      // Google Forms ARIA single-choice (radio) questions — pick ONE value from options list
+      ariaRadioGroups: (data.categories.ariaRadioGroups ?? []).filter(visible).map((f) => ({
+        label: f.label, required: f.required, currentValue: f.value ?? null, options: f.options,
+        type: 'single_choice',
+      })),
+      // Google Forms ARIA multi-choice (checkbox) questions — value may be comma-separated
+      ariaCheckboxGroups: (data.categories.ariaCheckboxGroups ?? []).filter(visible).map((f) => ({
+        label: f.label, required: f.required, currentValue: f.value ?? null, options: f.options,
+        type: 'multi_choice',
+      })),
     },
     applyButtons: data.categories.applyButtons.map((f) => ({ text: f.value, href: f.href ?? null })),
     navigationLinks: data.categories.navigationLinks.map((f) => ({ text: f.value, href: f.href })),
@@ -215,6 +229,8 @@ TASK — decide ONE action:
    - checkboxes: Terms/consent/privacy → value:"true". Marketing opt-in → value:"false". When in doubt, value:"true".
    - fileUploads: DO NOT include fill instructions — the extension auto-uploads the resume PDF.
    - yesNoQuestions: MUST include a fill instruction for EACH unanswered yes/no question. Use the exact question label. Value must be "yes" or "no". For skills/qualification questions, pick "yes". The extension will click the correct button.
+   - ariaRadioGroups (Google Forms single-choice): MUST include a fill instruction for EACH group that has no currentValue. Use the exact question label. Value must be the EXACT text of one option from the options list. The extension clicks the matching radio option.
+   - ariaCheckboxGroups (Google Forms multi-choice): MUST include a fill instruction for EACH group that has no currentValue. Use the exact question label. Value should be the EXACT text of the most appropriate option(s) — comma-separated if multiple apply (e.g. "LinkedIn, Job board"). The extension clicks each matching checkbox.
    - Education/Experience fields (school, degree, company, job title, start/end dates): fill using DEMO_USER.educationHistory[0] and DEMO_USER.workExperience[0].
    - Every fill instruction must include: label AND (name OR id if available), value, source.
    - Review page (totalVisibleInputs=0, submit button visible): return fills:[] — extension clicks Submit automatically.

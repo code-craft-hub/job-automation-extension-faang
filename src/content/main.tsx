@@ -644,6 +644,45 @@ function fillElement(el: Element, value: string): boolean | 'custom' {
   // File upload — handled separately in the FILL_AND_SUBMIT async block
   if (type === 'file') return false
 
+  const role = el.getAttribute('role')
+
+  // ARIA radio group (Google Forms single-choice questions)
+  // Finds the child [role="radio"] whose label/data-value best matches value and clicks it.
+  if (role === 'radiogroup') {
+    const opts = Array.from(el.querySelectorAll<HTMLElement>('[role="radio"]'))
+    const needle = normalizeText(value)
+    const target = opts.find(o => {
+      const t = normalizeText(o.getAttribute('aria-label') ?? o.getAttribute('data-value') ?? o.textContent ?? '')
+      return t === needle || t.includes(needle) || needle.includes(t)
+    })
+    if (target) {
+      clickOption(target)
+      console.log(`[CS] ✓ ARIA radio "${getLabel(el)}": "${target.textContent?.trim()}"`)
+      return true
+    }
+    console.warn(`[CS] ARIA radiogroup "${getLabel(el)}": no option matching "${value}"`)
+    return false
+  }
+
+  // ARIA checkbox group (Google Forms multi-choice questions)
+  // value may be a single option or comma-separated list; clicks all matching checkboxes.
+  if (role === 'group') {
+    const cbs = Array.from(el.querySelectorAll<HTMLElement>('[role="checkbox"]'))
+    if (cbs.length === 0) return false
+    const targets = value.split(/[,;]/).map(v => normalizeText(v.trim())).filter(Boolean)
+    let any = false
+    for (const cb of cbs) {
+      const t = normalizeText(cb.getAttribute('aria-label') ?? cb.getAttribute('data-value') ?? cb.textContent ?? '')
+      if (targets.some(n => t === n || t.includes(n) || n.includes(t))) {
+        if (cb.getAttribute('aria-checked') !== 'true') clickOption(cb)
+        any = true
+      }
+    }
+    if (any) console.log(`[CS] ✓ ARIA checkbox group "${getLabel(el)}": matched "${value}"`)
+    else console.warn(`[CS] ARIA checkbox group "${getLabel(el)}": no options matching "${value}"`)
+    return any
+  }
+
   let filled = false
 
   // YES/NO boolean button — just click it (resolveElement already picked the right one)
@@ -796,7 +835,8 @@ function resolveElement(instr: FillInstruction): Element | null {
       if (nested) return nested
     }
     // Match by placeholder / aria-label / name on any form-like element
-    for (const el of qAll('input, select, textarea, [role="combobox"], [aria-haspopup], [aria-expanded]')) {
+    // Includes ARIA radio groups and checkbox groups (Google Forms pattern)
+    for (const el of qAll('input, select, textarea, [role="combobox"], [aria-haspopup], [aria-expanded], [role="radiogroup"], [role="group"]')) {
       const lbl2 = getLabel(el).toLowerCase().replace(/[*\s]+/g, ' ').trim()
       if (lbl2 && (lbl2.includes(needle) || needle.includes(lbl2))) return el
     }
@@ -903,6 +943,28 @@ function getUnfilledRequired(): UnfilledField[] {
       type: 'radio',
       options: [...new Set(radios.map((r) => r.value).filter(Boolean))],
     })
+  }
+
+  // ARIA radio groups (Google Forms single-choice questions)
+  for (const group of qAll('[role="radiogroup"]')) {
+    if (!isVisible(group)) continue
+    if (!isRequiredEl(group)) continue
+    if (group.querySelector('[role="radio"][aria-checked="true"]')) continue
+    const opts = Array.from(group.querySelectorAll<HTMLElement>('[role="radio"]'))
+      .map(o => o.getAttribute('aria-label') || o.getAttribute('data-value') || o.textContent?.trim() || '')
+      .filter(Boolean)
+    add({ label: getLabel(group), id: group.getAttribute('id') || undefined, type: 'aria_radio', options: opts })
+  }
+
+  // ARIA checkbox groups (Google Forms multi-choice questions)
+  for (const group of qAll('[role="group"]')) {
+    if (!isVisible(group)) continue
+    const cbs = Array.from(group.querySelectorAll<HTMLElement>('[role="checkbox"]'))
+    if (cbs.length === 0) continue
+    if (!isRequiredEl(group)) continue
+    if (cbs.some(cb => cb.getAttribute('aria-checked') === 'true')) continue
+    const opts = cbs.map(cb => cb.getAttribute('aria-label') || cb.getAttribute('data-value') || cb.textContent?.trim() || '').filter(Boolean)
+    add({ label: getLabel(group), id: group.getAttribute('id') || undefined, type: 'aria_checkbox', options: opts })
   }
 
   // Fields in aria-invalid error state
@@ -1145,10 +1207,50 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       })
     }
 
+    // ── ARIA radio groups (Google Forms single-choice questions) ────────────────
+    // [role="radiogroup"] with [role="radio"] children — not standard <input type="radio">
+    const ariaRadioGroups: ElementInfo[] = []
+    for (const group of qAll('[role="radiogroup"]')) {
+      if (!isVisible(group)) continue
+      const opts = Array.from(group.querySelectorAll<HTMLElement>('[role="radio"]'))
+      if (opts.length === 0) continue
+      const options = opts.map(o =>
+        o.getAttribute('aria-label') || o.getAttribute('data-value') || o.textContent?.trim() || '',
+      ).filter(s => s.length > 0 && s.length < 200)
+      const selected = opts.find(o => o.getAttribute('aria-checked') === 'true')
+      ariaRadioGroups.push(info(group, {
+        value: selected
+          ? (selected.getAttribute('aria-label') || selected.getAttribute('data-value') || selected.textContent?.trim())
+          : undefined,
+        options: options.length > 0 ? options : undefined,
+      }))
+    }
+
+    // ── ARIA checkbox groups (Google Forms multi-choice questions) ───────────────
+    // [role="group"] with [role="checkbox"] children — not standard <input type="checkbox">
+    const ariaCheckboxGroups: ElementInfo[] = []
+    for (const group of qAll('[role="group"]')) {
+      if (!isVisible(group)) continue
+      const cbs = Array.from(group.querySelectorAll<HTMLElement>('[role="checkbox"]'))
+      if (cbs.length === 0) continue
+      const options = cbs.map(cb =>
+        cb.getAttribute('aria-label') || cb.getAttribute('data-value') || cb.textContent?.trim() || '',
+      ).filter(s => s.length > 0 && s.length < 200)
+      const selected = cbs
+        .filter(cb => cb.getAttribute('aria-checked') === 'true')
+        .map(cb => cb.getAttribute('aria-label') || cb.getAttribute('data-value') || cb.textContent?.trim() || '')
+        .filter(Boolean)
+      ariaCheckboxGroups.push(info(group, {
+        value: selected.length > 0 ? selected.join(', ') : undefined,
+        options: options.length > 0 ? options : undefined,
+      }))
+    }
+
     const categories = {
       textFields, dateFields, fileUploads, checkboxes, radios,
       dropdowns, textareas, buttons, navigationLinks, applyButtons, richTextEditors,
       customComponents, customSelects, yesNoQuestions, hiddenInputs,
+      ariaRadioGroups, ariaCheckboxGroups,
     }
     const totals = Object.fromEntries(Object.entries(categories).map(([k, v]) => [k, v.length]))
 
