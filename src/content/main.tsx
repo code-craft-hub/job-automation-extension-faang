@@ -569,9 +569,49 @@ async function uploadResume(input: HTMLInputElement): Promise<boolean> {
     const file = new File([blob], 'John_Doe_Resume.pdf', { type: 'application/pdf' })
     const dt = new DataTransfer()
     dt.items.add(file)
-    input.files = dt.files
+
+    // Pin our DataTransfer to the `files` getter with defineProperty so that
+    // even if the site calls `input.value = ''` (a common reset pattern that
+    // normally clears the native FileList), reads of `input.files` always
+    // return our file — preventing it from "going away" after React re-renders.
+    try {
+      Object.defineProperty(input, 'files', {
+        get: () => dt.files,
+        configurable: true,
+      })
+    } catch {
+      // Fallback if defineProperty is blocked (e.g. already non-configurable)
+      input.files = dt.files
+    }
+
+    // Dispatch native DOM events — React 17+ delegates at the root container,
+    // so these reach React's synthetic event system correctly.
     input.dispatchEvent(new Event('change', { bubbles: true }))
     input.dispatchEvent(new Event('input', { bubbles: true }))
+
+    // Also call React's own onChange handler directly when present.
+    // React 17 stores props under __reactProps$<hash>, React 16 under __reactEventHandlers$<hash>.
+    // Calling it directly ensures react-hook-form / formik update their internal state
+    // even when isTrusted=false events are filtered.
+    const reactKey = Object.keys(input).find(
+      (k) => k.startsWith('__reactEventHandlers') || k.startsWith('__reactProps'),
+    )
+    if (reactKey) {
+      const rProps = (input as unknown as Record<string, Record<string, unknown>>)[reactKey]
+      const onChange = rProps?.onChange
+      if (typeof onChange === 'function') {
+        onChange({
+          target: input, currentTarget: input, type: 'change',
+          bubbles: true, cancelable: true, isTrusted: false,
+          preventDefault: () => {}, stopPropagation: () => {},
+        })
+        console.log('[CS] ✓ Resume: React internal onChange called')
+      }
+    }
+
+    // Wait for any async upload flow (e.g. Workable's presign → S3 PUT) to settle
+    // before we move on to filling other fields that might trigger re-renders.
+    await delay(800)
     console.log('[CS] ✓ Resume uploaded to file input')
     return true
   } catch (e) {
