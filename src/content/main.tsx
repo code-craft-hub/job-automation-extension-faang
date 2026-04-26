@@ -47,6 +47,10 @@ const FINAL_SUBMIT_RE =
 const CONTINUE_RE =
   /\b(continue|next|next step|save and continue|save & continue|proceed|go to next)\b/i
 
+// Matches the visible text content of YES/NO boolean button components
+const BOOL_BTN_YES_RE = /^\s*[✓✔☑]?\s*yes\s*$/i
+const BOOL_BTN_NO_RE  = /^\s*[✗✘☒×]?\s*no\s*$/i
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function delay(ms: number): Promise<void> {
@@ -272,7 +276,66 @@ function collectVisibleOptions(): HTMLElement[] {
   return Array.from(document.querySelectorAll<HTMLElement>(OPTION_SEL)).filter(isVisible)
 }
 
-// Open a custom dropdown and return the set of option elements that appeared.
+// Read the Gemini API key stored by the side panel.
+async function getStoredApiKey(): Promise<string | null> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get('geminiApiKey', (r) => {
+      resolve((r.geminiApiKey as string | undefined) ?? null)
+    })
+  })
+}
+
+// Ask Gemini to pick the single best option from a known list.
+// Used when the initial fill value doesn't match any real option.
+async function askGeminiToPickOption(
+  apiKey: string,
+  fieldLabel: string,
+  optionTexts: string[],
+): Promise<string | null> {
+  const prompt = `You are filling a job application form field.
+
+Field label: "${fieldLabel}"
+Available options (pick exactly one):
+${optionTexts.map((o, i) => `${i + 1}. ${o}`).join('\n')}
+
+The applicant is a Software Engineer with 5 years of experience and a Bachelor's degree in Computer Science.
+Reply with ONLY the exact text of the best matching option — no explanation, no punctuation around it.`
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      },
+    )
+    if (!res.ok) return null
+    const json = await res.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
+    return json.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? null
+  } catch {
+    return null
+  }
+}
+
+// Find the best matching option element from a list given a normalized needle.
+function findBestMatch(options: HTMLElement[], needle: string): HTMLElement | null {
+  // Exact match
+  for (const opt of options) {
+    const txt = normalizeText(opt.textContent ?? '')
+    const dv  = normalizeText(opt.getAttribute('data-value') ?? opt.getAttribute('data-id') ?? '')
+    if (txt === needle || dv === needle) return opt
+  }
+  // Partial / substring match
+  for (const opt of options) {
+    const txt = normalizeText(opt.textContent ?? '')
+    const dv  = normalizeText(opt.getAttribute('data-value') ?? opt.getAttribute('data-id') ?? '')
+    if (txt.includes(needle) || needle.includes(txt) || dv.includes(needle)) return opt
+  }
+  return null
+}
+
+// Open a custom dropdown and return the list of option elements that appeared.
 async function openAndGetOptions(trigger: HTMLElement): Promise<HTMLElement[]> {
   const before = new Set(collectVisibleOptions())
 
@@ -283,110 +346,129 @@ async function openAndGetOptions(trigger: HTMLElement): Promise<HTMLElement[]> {
 
   await delay(650)
 
-  // Prefer newly appeared options (portal pattern)
   const after = collectVisibleOptions()
   const newOpts = after.filter(o => !before.has(o))
+  // Prefer newly appeared (portal), but fall back to all visible if nothing new
   return newOpts.length > 0 ? newOpts : after
 }
 
-// Clicks a custom dropdown, waits for options to appear, clicks the matching option.
+// Close any open dropdown overlay cleanly.
+function closeDropdown(trigger: HTMLElement): void {
+  trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+}
+
+// Core fill routine: open → collect real options → resolve best pick → click.
 async function fillCustomDropdown(el: Element, value: string): Promise<boolean> {
   const trigger = findDropdownTrigger(el)
-  const needle = normalizeText(value)
+  const label   = getLabel(el)
 
+  // ── Step 1: Open and collect all available options ──────────────────────────
   const options = await openAndGetOptions(trigger)
-
   if (options.length === 0) {
-    console.warn(`[CS] Custom dropdown opened but no options found for "${value}"`)
-    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    console.warn(`[CS] Custom dropdown "${label}": opened but no options found`)
+    closeDropdown(trigger)
     return false
   }
 
-  // 1. Try typing into a search box if one appeared (Workable pattern)
+  const optionTexts = [...new Set(
+    options.map(o => o.textContent?.trim() ?? '').filter(t => t.length > 0 && t.length < 120)
+  )]
+  console.log(`[CS] Custom dropdown "${label}": ${optionTexts.length} options — ${optionTexts.slice(0, 5).join(', ')}...`)
+
+  // ── Step 2: Resolve which option to click ───────────────────────────────────
+  let targetText: string | null = null
+
+  // 2a. Try matching against the Gemini-provided value directly
+  const directMatch = findBestMatch(options, normalizeText(value))
+  if (directMatch) {
+    targetText = directMatch.textContent?.trim() ?? null
+  }
+
+  // 2b. If no match: ask Gemini to pick from the REAL option list
+  if (!targetText) {
+    console.log(`[CS] Custom dropdown "${label}": "${value}" not in list — asking Gemini...`)
+    const apiKey = await getStoredApiKey()
+    if (apiKey) {
+      const picked = await askGeminiToPickOption(apiKey, label, optionTexts)
+      console.log(`[CS] Custom dropdown "${label}": Gemini picked → "${picked}"`)
+      if (picked) targetText = picked
+    }
+  }
+
+  // 2c. Last resort: pick the first meaningful option (for required fields)
+  if (!targetText) {
+    if (isRequiredEl(el) && optionTexts[0]) {
+      targetText = optionTexts[0]
+      console.log(`[CS] Custom dropdown "${label}": fallback → first option "${targetText}"`)
+    } else {
+      closeDropdown(trigger)
+      console.warn(`[CS] Custom dropdown "${label}": no suitable option found`)
+      return false
+    }
+  }
+
+  // ── Step 3: Click the resolved option ───────────────────────────────────────
+  // Strategy A: use the search box to filter to exactly that option, then click
   const searchInput = Array.from(document.querySelectorAll<HTMLInputElement>(
-    'input[type="search"], input[type="text"][placeholder*="earch"], input[placeholder*="earch"]'
+    'input[type="search"], input[placeholder*="earch"], input[placeholder*="ilter"]'
   )).find(isVisible)
 
   if (searchInput) {
-    // Type the value to filter the list
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
-    setter?.call(searchInput, value)
+    setter?.call(searchInput, targetText)
     searchInput.dispatchEvent(new Event('input', { bubbles: true }))
     searchInput.dispatchEvent(new Event('change', { bubbles: true }))
-    await delay(400)
-    // Re-collect options after filtering
+    await delay(350)
+
     const filtered = collectVisibleOptions()
-    const firstFiltered = filtered[0]
-    if (firstFiltered) {
-      clickOption(firstFiltered)
-      console.log(`[CS] ✓ Custom dropdown (search-filtered): "${firstFiltered.textContent?.trim()}"`)
+    const hit = filtered.find(o => normalizeText(o.textContent ?? '').includes(normalizeText(targetText!)))
+    if (hit) {
+      clickOption(hit)
+      console.log(`[CS] ✓ Custom dropdown "${label}" (search): "${hit.textContent?.trim()}"`)
       await delay(200)
       return true
     }
+    // Search filtered to empty — clear the search box and fall through to direct click
+    setter?.call(searchInput, '')
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }))
+    await delay(250)
   }
 
-  // 2. Try exact + partial text matching on the collected options
-  // First pass: exact match
-  for (const opt of options) {
-    const txt = normalizeText(opt.textContent ?? '')
-    const dataVal = normalizeText(
-      opt.getAttribute('data-value') ?? opt.getAttribute('data-id') ?? opt.getAttribute('value') ?? ''
-    )
-    if (txt === needle || dataVal === needle) {
-      clickOption(opt)
-      console.log(`[CS] ✓ Custom dropdown (exact): "${opt.textContent?.trim()}"`)
-      await delay(150)
-      return true
-    }
-  }
-
-  // Second pass: partial / substring match
-  for (const opt of options) {
-    const txt = normalizeText(opt.textContent ?? '')
-    const dataVal = normalizeText(
-      opt.getAttribute('data-value') ?? opt.getAttribute('data-id') ?? opt.getAttribute('value') ?? ''
-    )
-    if (txt.includes(needle) || needle.includes(txt) || dataVal.includes(needle)) {
-      clickOption(opt)
-      console.log(`[CS] ✓ Custom dropdown (partial): "${opt.textContent?.trim()}"`)
-      await delay(150)
-      return true
-    }
-  }
-
-  // 3. Fallback: pick the FIRST real option (better than leaving required field empty)
-  const firstMeaningful = options.find(o => {
-    const txt = o.textContent?.trim() ?? ''
-    return txt.length > 0 && txt.length < 120
-  })
-  if (firstMeaningful && isRequiredEl(el)) {
-    clickOption(firstMeaningful)
-    console.log(`[CS] ✓ Custom dropdown (fallback-first): "${firstMeaningful.textContent?.trim()}"`)
+  // Strategy B: direct click on the matching element in the collected options
+  const target = findBestMatch(options, normalizeText(targetText))
+  if (target && isVisible(target)) {
+    clickOption(target)
+    console.log(`[CS] ✓ Custom dropdown "${label}" (direct): "${target.textContent?.trim()}"`)
     await delay(150)
     return true
   }
 
-  // Close if nothing matched
-  trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
-  console.warn(`[CS] Custom dropdown: no option matching "${value}"`)
+  // Strategy C: re-collect after clearing search and try again
+  const fresh = collectVisibleOptions()
+  const freshHit = findBestMatch(fresh, normalizeText(targetText))
+  if (freshHit) {
+    clickOption(freshHit)
+    console.log(`[CS] ✓ Custom dropdown "${label}" (re-collected): "${freshHit.textContent?.trim()}"`)
+    await delay(150)
+    return true
+  }
+
+  closeDropdown(trigger)
+  console.warn(`[CS] Custom dropdown "${label}": could not click option "${targetText}"`)
   return false
 }
 
 // Open a custom dropdown, collect all option texts, then close it.
-// Used during scan to pre-fetch available options for Gemini.
+// Used during GET_JOB_ELEMENTS scan to give Gemini the real option list.
 async function extractDropdownOptions(el: Element): Promise<string[]> {
   const trigger = findDropdownTrigger(el)
   const options = await openAndGetOptions(trigger)
   const texts = [...new Set(
-    options
-      .map(o => o.textContent?.trim() ?? '')
-      .filter(t => t.length > 0 && t.length < 120)
+    options.map(o => o.textContent?.trim() ?? '').filter(t => t.length > 0 && t.length < 120)
   )]
-  // Close the dropdown
-  trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
-  await delay(200)
+  closeDropdown(trigger)
+  await delay(250)
   return texts
 }
 
@@ -451,6 +533,15 @@ function fillElement(el: Element, value: string): boolean | 'custom' {
 
   let filled = false
 
+  // YES/NO boolean button — just click it (resolveElement already picked the right one)
+  if (tag === 'button') {
+    const btnText = (el as HTMLElement).textContent?.trim() ?? ''
+    // Guard: do not click form-action buttons accidentally
+    if (FINAL_SUBMIT_RE.test(btnText) || CONTINUE_RE.test(btnText)) return false
+    ;(el as HTMLElement).click()
+    return true
+  }
+
   if (tag === 'select') {
     const sel = el as HTMLSelectElement
     const option = Array.from(sel.options).find(
@@ -512,9 +603,57 @@ function fillElement(el: Element, value: string): boolean | 'custom' {
   return filled
 }
 
+// ── YES/NO boolean question helpers ──────────────────────────────────────────
+
+// Returns true when a YES/NO button pair is "answered" (one button is selected/active).
+function isBoolAnswered(parent: Element): boolean {
+  const btns = Array.from(parent.querySelectorAll<HTMLElement>('button'))
+  return btns.some((b) => {
+    const ap = b.getAttribute('aria-pressed')
+    const as_ = b.getAttribute('aria-selected')
+    const ds = b.getAttribute('data-selected') ?? b.getAttribute('data-active')
+    const cl = b.classList
+    if (ap === 'true' || as_ === 'true' || ds === 'true') return true
+    if (cl.contains('selected') || cl.contains('active') || cl.contains('checked')) return true
+    // Heuristic: background colour differs from siblings (active button is highlighted)
+    const bg = window.getComputedStyle(b).backgroundColor
+    return btns.filter(o => o !== b).some(o => window.getComputedStyle(o).backgroundColor !== bg)
+  })
+}
+
+// Find the YES button or NO button for a given question label text.
+// Looks in heading/label/legend elements, then walks up to find the button pair.
+function findYesNoButton(questionLabel: string, answer: 'yes' | 'no'): HTMLElement | null {
+  const needle = questionLabel.toLowerCase().replace(/[*\s]+/g, ' ').trim()
+  const targetRE = answer === 'yes' ? BOOL_BTN_YES_RE : BOOL_BTN_NO_RE
+
+  const HEADING_SEL = 'label, legend, h1, h2, h3, h4, h5, p, div, span, [class*="label"], [class*="question"]'
+  for (const el of Array.from(document.querySelectorAll<HTMLElement>(HEADING_SEL))) {
+    const txt = (el.textContent ?? '').toLowerCase().replace(/[*\s]+/g, ' ').trim()
+    if (!txt || txt.length > 300) continue
+    if (!txt.includes(needle) && !needle.includes(txt)) continue
+
+    // Walk up to find a container that also holds the YES/NO buttons
+    let scope: Element | null = el
+    for (let i = 0; i < 6 && scope; i++) {
+      const btn = Array.from(scope.querySelectorAll<HTMLElement>('button'))
+        .find((b) => targetRE.test(b.textContent?.trim() ?? '') && isVisible(b))
+      if (btn) return btn
+      scope = scope.parentElement
+    }
+  }
+  return null
+}
+
 // ── Resolve element ────────────────────────────────────────────────────────────
 
 function resolveElement(instr: FillInstruction): Element | null {
+  // YES/NO boolean buttons — special path before generic resolution
+  if (instr.value && /^(yes|no)$/i.test(instr.value) && instr.label) {
+    const btn = findYesNoButton(instr.label, instr.value.toLowerCase() as 'yes' | 'no')
+    if (btn) return btn
+  }
+
   if (instr.name) {
     try {
       const el = document.querySelector(`[name="${CSS.escape(instr.name)}"]`)
@@ -637,6 +776,32 @@ function getUnfilledRequired(): UnfilledField[] {
     if (name || id) add({ label: getLabel(el), name, id, type: 'invalid' })
   }
 
+  // YES/NO boolean button pairs that have not been answered
+  const seenBoolParents = new Set<Element>()
+  for (const btn of qAll('button')) {
+    if (!isVisible(btn)) continue
+    if (!BOOL_BTN_YES_RE.test(btn.textContent?.trim() ?? '')) continue
+    const parent = btn.parentElement
+    if (!parent || seenBoolParents.has(parent)) continue
+
+    const noBtn = Array.from(parent.querySelectorAll<HTMLElement>('button'))
+      .find(b => BOOL_BTN_NO_RE.test(b.textContent?.trim() ?? '') && isVisible(b))
+    if (!noBtn) continue
+
+    seenBoolParents.add(parent)
+    if (isBoolAnswered(parent)) continue // already answered
+
+    // Find the question label text
+    const section = parent.closest('[class*="question"], fieldset, section') ?? parent.parentElement?.parentElement ?? parent.parentElement
+    const questionEl = section
+      ? Array.from(section.querySelectorAll('label, legend, h3, h4, p, [class*="label"], [class*="question"]'))
+          .find(e => e !== parent && (e.textContent?.trim() ?? '').length > 0)
+      : null
+    const label = questionEl?.textContent?.trim().replace(/\s+/g, ' ') ?? 'Boolean question'
+    const isReq = /\*/.test(label)
+    if (isReq) add({ label, type: 'yes_no', options: ['yes', 'no'] })
+  }
+
   return result
 }
 
@@ -742,16 +907,38 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .filter((el) => !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(el.tagName))
       .map((el) => info(el))
 
-    // Custom dropdowns: elements with aria-haspopup or aria-expanded that act as select triggers.
-    // We open each one briefly to extract the real available options for Gemini.
-    const customSelectEls = qAll('[aria-haspopup], [aria-expanded]')
-      .filter((el) => {
-        if (['SELECT', 'TEXTAREA'].includes(el.tagName)) return false
-        if (!isVisible(el)) return false
-        const txt = el.textContent?.trim() ?? ''
-        if (APPLY_RE.test(txt) || CONTINUE_RE.test(txt) || FINAL_SUBMIT_RE.test(txt)) return false
-        return true
-      })
+    // Custom dropdowns: detect triggers using multiple strategies, then open each
+    // briefly to extract the REAL available options before asking Gemini.
+    //
+    // Strategy 1: ARIA attributes (standard)
+    // Strategy 2: "Select an option…" placeholder text (Workable / most custom selects)
+    // Strategy 3: isCustomDropdown() match on common candidates
+    const PLACEHOLDER_RE = /^(select an option|select\.\.\.|choose\.\.\.|please select|choose an option)\.?\.?\.?$/i
+
+    const candidateEls: Element[] = []
+    const seen = new Set<Element>()
+    function addCandidate(el: Element) {
+      if (!seen.has(el) && isVisible(el)) { seen.add(el); candidateEls.push(el) }
+    }
+
+    // ARIA-based
+    for (const el of qAll('[aria-haspopup], [aria-expanded], [role="combobox"]')) addCandidate(el)
+    // Placeholder-text-based (Workable pattern: div/button that shows "Select an option...")
+    for (const el of qAll('button, [role="button"], div, span')) {
+      const txt = el.textContent?.trim() ?? ''
+      if (PLACEHOLDER_RE.test(txt)) addCandidate(el)
+    }
+    // Read-only inputs inside styled containers
+    for (const el of qAll('input[readonly]')) {
+      if (isCustomDropdown(el)) addCandidate(el)
+    }
+
+    const customSelectEls = candidateEls.filter((el) => {
+      if (['SELECT', 'TEXTAREA'].includes(el.tagName)) return false
+      const txt = el.textContent?.trim() ?? ''
+      if (APPLY_RE.test(txt) || CONTINUE_RE.test(txt) || FINAL_SUBMIT_RE.test(txt)) return false
+      return true
+    })
 
     const customSelects: ElementInfo[] = []
     for (const el of customSelectEls) {
@@ -770,10 +957,45 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       value: (el as HTMLInputElement).value || undefined,
     }))
 
+    // YES/NO boolean question button pairs (Workable custom boolean components)
+    const yesNoQuestions: ElementInfo[] = []
+    const seenBoolParents = new Set<Element>()
+    for (const btn of qAll('button')) {
+      if (!isVisible(btn)) continue
+      if (!BOOL_BTN_YES_RE.test(btn.textContent?.trim() ?? '')) continue
+      const parent = btn.parentElement
+      if (!parent || seenBoolParents.has(parent)) continue
+
+      const noBtn = Array.from(parent.querySelectorAll<HTMLElement>('button'))
+        .find(b => BOOL_BTN_NO_RE.test(b.textContent?.trim() ?? '') && isVisible(b))
+      if (!noBtn) continue
+
+      seenBoolParents.add(parent)
+
+      // Extract the question label from the nearest heading/label element
+      const section = parent.closest('[class*="question"], fieldset, section') ?? parent.parentElement?.parentElement ?? parent.parentElement
+      const questionEl = section
+        ? Array.from(section.querySelectorAll('label, legend, h3, h4, p, [class*="label"], [class*="question"]'))
+            .find(e => e !== parent && (e.textContent?.trim() ?? '').length > 0)
+        : null
+      const label = questionEl?.textContent?.trim().replace(/\s+/g, ' ') ?? 'Yes/No question'
+      const isAnswered = isBoolAnswered(parent)
+
+      yesNoQuestions.push({
+        tag: 'button',
+        type: 'yes_no',
+        label,
+        required: /\*/.test(label),
+        visible: true,
+        value: isAnswered ? 'answered' : undefined,
+        options: ['yes', 'no'],
+      })
+    }
+
     const categories = {
       textFields, dateFields, fileUploads, checkboxes, radios,
       dropdowns, textareas, buttons, navigationLinks, applyButtons, richTextEditors,
-      customComponents, customSelects, hiddenInputs,
+      customComponents, customSelects, yesNoQuestions, hiddenInputs,
     }
     const totals = Object.fromEntries(Object.entries(categories).map(([k, v]) => [k, v.length]))
 

@@ -31,7 +31,8 @@ type JobData = {
     applyButtons: FieldInfo[];
     richTextEditors: FieldInfo[];
     customComponents: FieldInfo[];
-    customSelects: FieldInfo[];
+    customSelects?: FieldInfo[];
+    yesNoQuestions?: FieldInfo[];
     hiddenInputs: FieldInfo[];
   };
 };
@@ -145,7 +146,8 @@ function countVisibleInputs(data: JobData): number {
     ...data.categories.radios,
     ...data.categories.dropdowns,
     ...data.categories.textareas,
-    ...data.categories.customSelects,
+    ...(data.categories.customSelects ?? []),
+    ...(data.categories.yesNoQuestions ?? []),
   ].filter((f) => f.visible !== false).length;
 }
 
@@ -172,9 +174,13 @@ function buildPrompt(data: JobData): string {
       checkboxes: data.categories.checkboxes.filter(visible).map((f) => ({ label: f.label, name: f.name, required: f.required })),
       radioGroups,
       dropdowns: data.categories.dropdowns.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required, options: f.options?.slice(0, 12) })),
-      // Custom React/JS dropdowns — fill by label; extension will click-open and pick the option
-      customSelects: data.categories.customSelects.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required, currentValue: f.value })),
+      // Custom React/JS dropdowns — real options pre-fetched from DOM, Gemini picks from this list
+      customSelects: (data.categories.customSelects ?? []).filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required, currentValue: f.value, options: f.options })),
       textareas: data.categories.textareas.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
+      // YES/NO boolean button questions — fill with value "yes" or "no" (extension clicks the button)
+      yesNoQuestions: (data.categories.yesNoQuestions ?? [])
+        .filter(f => f.value !== 'answered') // skip already answered
+        .map((f) => ({ label: f.label, required: f.required, options: ['yes', 'no'] })),
     },
     applyButtons: data.categories.applyButtons.map((f) => ({ text: f.value, href: f.href ?? null })),
     navigationLinks: data.categories.navigationLinks.map((f) => ({ text: f.value, href: f.href })),
@@ -205,6 +211,7 @@ TASK — decide ONE action:
    - radioGroups: pick one option value. For YES/NO questions, pick "yes".
    - checkboxes: Terms/consent/privacy → value:"true". Marketing opt-in → value:"false". When in doubt, value:"true".
    - fileUploads: DO NOT include fill instructions — the extension auto-uploads the resume PDF.
+   - yesNoQuestions: MUST include a fill instruction for EACH unanswered yes/no question. Use the exact question label. Value must be "yes" or "no". For skills/qualification questions, pick "yes". The extension will click the correct button.
    - Education/Experience fields (school, degree, company, job title, start/end dates): fill using DEMO_USER.educationHistory[0] and DEMO_USER.workExperience[0].
    - Every fill instruction must include: label AND (name OR id if available), value, source.
    - Review page (totalVisibleInputs=0, submit button visible): return fills:[] — extension clicks Submit automatically.
@@ -439,6 +446,7 @@ ${JSON.stringify(fields, null, 2)}
 
 Rules:
 - custom_select: options[] lists the ACTUAL available options from the dropdown. You MUST pick ONE value EXACTLY as written in the options array. Do NOT invent a value.
+- yes_no: value must be exactly "yes" or "no". For skills/qualification questions pick "yes".
 - radio: pick the most appropriate option from the options array. For YES/NO, pick "yes".
 - select: pick the most appropriate non-empty option value from options array.
 - textarea / text: generate a concise, relevant answer based on job context and demo user.
