@@ -156,6 +156,10 @@ TASK — decide ONE action:
      * Map demo user data to matching fields (source: "demo_user")
      * For open-ended questions (e.g. "Why do you want this role?", skills assessments), generate a realistic answer from the job context (source: "ai_generated")
      * Every fill: name or id, label, value, source
+     * CRITICAL — Checkboxes: ALWAYS include every checkbox in your fills array.
+       - Terms, conditions, consent, privacy, agreement checkboxes → value: "true" (must be checked to proceed)
+       - Opt-in/marketing checkboxes → value: "false" (leave unchecked unless required)
+       - When in doubt, check it (value: "true") so the form can be submitted.
    - Review/confirmation page (totalVisibleInputs = 0 but page shows entered data or a final Submit button): return fills:[] (empty array). The extension will click the Submit button automatically.
 
 3. "navigate" — ONLY if this is a pure job listing/description page with NO applyButtons and NO application form visible.
@@ -420,7 +424,14 @@ export default function App() {
           continueCountRef.current++;
           log(`→ Clicked Continue [page ${continueCountRef.current}/${MAX_CONTINUE}] — waiting for next page...`);
           chrome.runtime.sendMessage({ type: "WATCH_CURRENT_TAB" });
-          // TAB_READY will trigger the next runCycle
+          // TAB_READY fires on real navigation; fallback handles validation errors (page stays same)
+          clickFallbackTimerRef.current = setTimeout(() => {
+            clickFallbackTimerRef.current = null;
+            if (isRunningRef.current) {
+              log("← No navigation — re-analyzing (validation error or same-page update)...");
+              runCycleRef.current?.();
+            }
+          }, 3500);
 
         } else {
           setSubmitResult(result);
