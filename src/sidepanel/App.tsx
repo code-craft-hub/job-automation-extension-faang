@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+// ── Types ──────────────────────────────────────────────────────────────────────
 
 type FieldInfo = {
   label: string;
@@ -16,6 +16,7 @@ type FieldInfo = {
 type JobData = {
   url: string;
   title: string;
+  pageText?: string;
   totals: Record<string, number>;
   categories: {
     textFields: FieldInfo[];
@@ -33,13 +34,34 @@ type JobData = {
   };
 };
 
-type FillInstruction = { name?: string; id?: string; value: string };
+type FillInstruction = {
+  name?: string;
+  id?: string;
+  label?: string;
+  value: string;
+  source?: string;
+};
 
 type Decision =
   | { action: "fill"; reason: string; fills: FillInstruction[] }
   | { action: "navigate"; reason: string; url: string };
 
-// ── Demo user ─────────────────────────────────────────────────────────────────
+type FillReportItem = {
+  label: string;
+  value: string;
+  source: string;
+  status: string;
+};
+
+type SubmitResult = {
+  filled: number;
+  submitted: boolean;
+  report: FillReportItem[];
+  url: string;
+  title: string;
+};
+
+// ── Demo user ──────────────────────────────────────────────────────────────────
 
 const DEMO_USER = {
   firstName: "John",
@@ -70,36 +92,36 @@ const DEMO_USER = {
     "Dear Hiring Manager,\n\nI am excited to apply for this position. With 5 years of software engineering experience, I bring strong expertise in JavaScript, TypeScript, React, and Node.js.\n\nBest regards,\nJohn Doe",
 };
 
-// ── Gemini ────────────────────────────────────────────────────────────────────
+// ── Gemini ─────────────────────────────────────────────────────────────────────
+
+function countVisibleInputs(data: JobData): number {
+  return [
+    ...data.categories.textFields,
+    ...data.categories.dateFields,
+    ...data.categories.fileUploads,
+    ...data.categories.checkboxes,
+    ...data.categories.radios,
+    ...data.categories.dropdowns,
+    ...data.categories.textareas,
+  ].filter((f) => f.visible !== false).length;
+}
 
 function buildPrompt(data: JobData): string {
-  // Only pass visible elements to Gemini — hidden fields belong to collapsed
-  // modals, off-screen sections, or site chrome (search bars, subscriptions).
   const visible = (f: FieldInfo) => f.visible !== false;
-
-  const visibleTextFields = data.categories.textFields.filter(visible);
-  const visibleDateFields = data.categories.dateFields.filter(visible);
-  const visibleFileUploads = data.categories.fileUploads.filter(visible);
-  const visibleCheckboxes = data.categories.checkboxes.filter(visible);
-  const visibleRadios = data.categories.radios.filter(visible);
-  const visibleDropdowns = data.categories.dropdowns.filter(visible);
-  const visibleTextareas = data.categories.textareas.filter(visible);
 
   const summary = {
     url: data.url,
     title: data.title,
+    totalVisibleInputs: countVisibleInputs(data),
     visibleFormFields: {
-      textFields: visibleTextFields.map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
-      dateFields: visibleDateFields.map((f) => ({ label: f.label, name: f.name, id: f.id })),
-      fileUploads: visibleFileUploads.map((f) => ({ label: f.label, name: f.name, accept: f.value })),
-      checkboxes: visibleCheckboxes.map((f) => ({ label: f.label, name: f.name })),
-      radios: visibleRadios.map((f) => ({ label: f.label, name: f.name, value: f.value })),
-      dropdowns: visibleDropdowns.map((f) => ({ label: f.label, name: f.name, options: f.options?.slice(0, 8) })),
-      textareas: visibleTextareas.map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
+      textFields: data.categories.textFields.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
+      dateFields: data.categories.dateFields.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id })),
+      fileUploads: data.categories.fileUploads.filter(visible).map((f) => ({ label: f.label, name: f.name, accept: f.value })),
+      checkboxes: data.categories.checkboxes.filter(visible).map((f) => ({ label: f.label, name: f.name })),
+      radios: data.categories.radios.filter(visible).map((f) => ({ label: f.label, name: f.name, value: f.value })),
+      dropdowns: data.categories.dropdowns.filter(visible).map((f) => ({ label: f.label, name: f.name, options: f.options?.slice(0, 8) })),
+      textareas: data.categories.textareas.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
     },
-    totalVisibleInputs:
-      visibleTextFields.length + visibleDateFields.length + visibleFileUploads.length +
-      visibleCheckboxes.length + visibleRadios.length + visibleDropdowns.length + visibleTextareas.length,
     navigationLinks: data.categories.navigationLinks.slice(0, 10).map((f) => ({
       text: f.value,
       href: f.href,
@@ -111,21 +133,26 @@ function buildPrompt(data: JobData): string {
 DEMO USER DATA:
 ${JSON.stringify(DEMO_USER, null, 2)}
 
-PAGE ELEMENTS (visible only — hidden/collapsed fields are excluded):
+JOB PAGE CONTEXT:
+${data.pageText ?? "(not available)"}
+
+PAGE ELEMENTS (visible only):
 ${JSON.stringify(summary, null, 2)}
 
-TASK:
-Decide ONE action:
-1. "fill" — ONLY if totalVisibleInputs > 2 AND the visible fields are clearly part of a job application form (name, email, CV, cover letter, etc.)
-2. "navigate" — if this looks like a job listing/description page, OR if visible form fields are just a search bar or email subscription (not an application form)
+TASK — decide ONE action:
 
-Key rule: if the page is a job listing showing a description, qualifications, and "how to apply" instructions — choose "navigate" even if some form fields exist on the page.
+1. "fill" — ONLY if totalVisibleInputs > 2 AND the visible fields are clearly a job application form (name, email, CV, cover letter, etc.).
+   - Map demo user data to matching fields (source: "demo_user")
+   - For fields NOT covered by demo user data (e.g. "Why do you want this role?", "Describe your experience with X", specific skill assessments), generate a realistic, relevant answer based on the job page context and the user's background (source: "ai_generated")
+   - Every fill must include: name or id, label (human-readable field name), value, source
 
-For "fill": map demo user data to each visible field. Use "name" to identify fields (fall back to "id").
-For "navigate": pick the single best URL from navigationLinks that leads to an application form or apply page.
+2. "navigate" — if this is a job listing/description page, OR if visible inputs are just a search bar / email subscription form (not an application).
+   - Choose the single best URL from navigationLinks that leads to a job application form.
+
+Key rule: If the page shows a job description with qualifications and "how to apply" instructions but no real application form fields → choose "navigate".
 
 Respond with ONLY valid JSON, no markdown:
-Fill: {"action":"fill","reason":"...","fills":[{"name":"fieldName","value":"..."}]}
+Fill: {"action":"fill","reason":"...","fills":[{"name":"fn","label":"First Name","value":"John","source":"demo_user"},...]}
 Navigate: {"action":"navigate","reason":"...","url":"https://..."}`;
 }
 
@@ -143,9 +170,7 @@ async function callGemini(apiKey: string, data: JobData): Promise<Decision> {
   );
 
   if (!res.ok) {
-    const err = (await res.json().catch(() => ({}))) as {
-      error?: { message?: string };
-    };
+    const err = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
     throw new Error(err?.error?.message ?? `Gemini API error ${res.status}`);
   }
 
@@ -155,9 +180,7 @@ async function callGemini(apiKey: string, data: JobData): Promise<Decision> {
   const raw = json.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!raw) throw new Error("Empty response from Gemini");
 
-  // Strip markdown code fences if Gemini ignores responseMimeType
   const text = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
-
   try {
     return JSON.parse(text) as Decision;
   } catch {
@@ -165,16 +188,57 @@ async function callGemini(apiKey: string, data: JobData): Promise<Decision> {
   }
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+// ── Report renderer ────────────────────────────────────────────────────────────
+
+function renderReport(result: SubmitResult): string {
+  const lines = [
+    "── SUBMIT REPORT ─────────────────────────────",
+    `Page:      ${result.title}`,
+    `URL:       ${result.url}`,
+    `Submitted: ${result.submitted ? "YES ✓" : "NO (submit button not found)"}`,
+    `Filled:    ${result.filled}/${result.report.length} fields`,
+    "",
+  ];
+
+  const filled = result.report.filter((r) => r.status === "filled");
+  const notFilled = result.report.filter((r) => r.status !== "filled");
+
+  if (filled.length > 0) {
+    lines.push(`── FILLED FIELDS (${filled.length}) ─────────────────────`);
+    for (const r of filled) {
+      const tag = r.source === "ai_generated" ? "[AI]   " : "[demo] ";
+      const val = r.value.length > 60 ? r.value.slice(0, 57) + "..." : r.value;
+      lines.push(`  ${tag} "${r.label}" → "${val}"`);
+    }
+    lines.push("");
+  }
+
+  if (notFilled.length > 0) {
+    lines.push(`── NOT FILLED (${notFilled.length}) ──────────────────────────`);
+    for (const r of notFilled) {
+      lines.push(`  [${r.status}] "${r.label}"`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+// ── Component ──────────────────────────────────────────────────────────────────
+
+type Phase = "idle" | "running" | "done" | "error";
 
 export default function App() {
   const [apiKey, setApiKey] = useState("");
-  const [status, setStatus] = useState("Enter your Gemini API key, then click Analyze.");
-  const [decision, setDecision] = useState<Decision | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [actionDone, setActionDone] = useState("");
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [submitResult, setSubmitResult] = useState<SubmitResult | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-loop engine refs
+  const isRunningRef = useRef(false);
+  const navCountRef = useRef(0);
+  const MAX_NAV = 5;
+  const runCycleRef = useRef<(() => Promise<void>) | null>(null);
 
   function log(msg: string) {
     const entry = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -182,171 +246,155 @@ export default function App() {
     setLogs((prev) => [...prev, entry]);
   }
 
-  // Auto-scroll logs to bottom
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
+  // Load saved API key
   useEffect(() => {
-    log("Side panel mounted");
     chrome.storage.local.get("geminiApiKey", (result) => {
       if (result.geminiApiKey) {
         setApiKey(result.geminiApiKey as string);
-        setStatus("API key loaded. Click Analyze to scan this page.");
-        log("API key loaded from storage");
+        log("API key loaded. Click Auto Apply to start.");
       } else {
-        log("No API key in storage");
+        log("No API key found. Enter one above.");
       }
     });
   }, []);
 
+  // Listen for TAB_READY from background (fires when navigated tab finishes loading)
+  useEffect(() => {
+    const handler = (message: unknown) => {
+      if ((message as { type?: string }).type === "TAB_READY" && isRunningRef.current) {
+        log("← Page loaded — re-analyzing in 1s...");
+        setTimeout(() => runCycleRef.current?.(), 1000);
+      }
+    };
+    chrome.runtime.onMessage.addListener(handler);
+    return () => chrome.runtime.onMessage.removeListener(handler);
+  }, []);
+
+  // Keep runCycle ref up-to-date after every render (avoids stale closure)
+  useEffect(() => {
+    runCycleRef.current = runCycle;
+  });
+
   function saveKey(key: string) {
     setApiKey(key);
     chrome.storage.local.set({ geminiApiKey: key });
-    log("API key saved to storage");
   }
 
-  async function analyze() {
-    if (!apiKey.trim()) {
-      setStatus("Please enter a Gemini API key first.");
-      log("Analyze blocked: no API key");
-      return;
-    }
-    setLoading(true);
-    setDecision(null);
-    setActionDone("");
-    log("Analyze started");
+  function stop() {
+    isRunningRef.current = false;
+    setPhase("idle");
+    log("Stopped.");
+  }
+
+  // ── Core helpers ─────────────────────────────────────────────────────────────
+
+  function scanPage(): Promise<JobData> {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: "GET_JOB_ELEMENTS" }, (response) => {
+        if (chrome.runtime.lastError) {
+          const msg = chrome.runtime.lastError.message ?? "Unknown";
+          reject(new Error(msg.includes("Receiving end") ? "Content script not found. Reload the page." : msg));
+          return;
+        }
+        const r = response as { error?: string } & JobData;
+        if (r.error) {
+          reject(new Error(r.error.includes("Receiving end") ? "Content script not found. Reload the page." : r.error));
+          return;
+        }
+        resolve(r);
+      });
+    });
+  }
+
+  function doFillAndSubmit(fills: FillInstruction[]): Promise<SubmitResult> {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: "FILL_AND_SUBMIT", fills }, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message ?? "Unknown"));
+          return;
+        }
+        const r = response as { error?: string } & SubmitResult;
+        if (r.error) { reject(new Error(r.error)); return; }
+        resolve(r);
+      });
+    });
+  }
+
+  // ── Main loop ─────────────────────────────────────────────────────────────────
+
+  async function runCycle() {
+    if (!isRunningRef.current) return;
 
     try {
-      setStatus("Scanning page elements...");
-      log("→ Sending GET_JOB_ELEMENTS to background...");
-
-      const elements = await new Promise<JobData>((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: "GET_JOB_ELEMENTS" }, (response) => {
-          if (chrome.runtime.lastError) {
-            const msg = chrome.runtime.lastError.message ?? "Unknown error";
-            log(`✗ Runtime error: ${msg}`);
-            if (msg.includes("Receiving end does not exist")) {
-              return reject(
-                new Error(
-                  "Content script not found on this tab.\n→ Reload the page (F5) and try again.\n→ Only works on https:// pages.",
-                ),
-              );
-            }
-            return reject(new Error(msg));
-          }
-          if (response?.error) {
-            const msg = response.error as string;
-            log(`✗ Response error: ${msg}`);
-            if (msg.includes("Receiving end does not exist")) {
-              return reject(
-                new Error(
-                  "Content script not found on this tab.\n→ Reload the page (F5) and try again.\n→ Only works on https:// pages.",
-                ),
-              );
-            }
-            return reject(new Error(msg));
-          }
-          resolve(response as JobData);
-        });
-      });
+      log(`[step ${navCountRef.current + 1}] Scanning page elements...`);
+      const elements = await scanPage();
 
       const totals = Object.entries(elements.totals)
         .filter(([, v]) => v > 0)
         .map(([k, v]) => `${k}=${v}`)
         .join(", ");
-      const visibleInputs = [
-        ...elements.categories.textFields,
-        ...elements.categories.dateFields,
-        ...elements.categories.fileUploads,
-        ...elements.categories.checkboxes,
-        ...elements.categories.radios,
-        ...elements.categories.dropdowns,
-        ...elements.categories.textareas,
-      ].filter((f) => f.visible !== false).length;
-      log(`← Elements received — ${totals}`);
-      log(`   Visible inputs: ${visibleInputs} (hidden inputs excluded from Gemini prompt)`);
-      log(`   Page: "${elements.title}" (${elements.url})`);
+      const visibleCount = countVisibleInputs(elements);
+      log(`← ${totals}`);
+      log(`   Visible inputs: ${visibleCount}`);
 
-      setStatus("Sending to Gemini...");
-      log("→ Calling Gemini API...");
+      log("→ Asking Gemini...");
+      const decision = await callGemini(apiKey, elements);
+      log(`← Gemini: ${decision.action.toUpperCase()} — ${decision.reason}`);
 
-      const result = await callGemini(apiKey, elements);
-      log(`← Gemini decision: ${result.action.toUpperCase()} — ${result.reason}`);
+      if (decision.action === "navigate") {
+        if (navCountRef.current >= MAX_NAV) {
+          throw new Error(`Reached max ${MAX_NAV} navigations without finding a form.`);
+        }
+        navCountRef.current++;
+        log(`→ Navigating [${navCountRef.current}/${MAX_NAV}]: ${decision.url}`);
+        // Navigate — background watches the tab and sends TAB_READY when loaded
+        chrome.runtime.sendMessage({ type: "NAVIGATE", url: decision.url });
+        // runCycle will be called again by the TAB_READY listener
 
-      if (result.action === "fill") {
-        log(`   ${result.fills.length} field(s) to fill:`);
-        result.fills.forEach((f) => {
-          const key = f.name ? `name="${f.name}"` : `id="${f.id}"`;
-          log(`   ${key} = "${f.value}"`);
-        });
       } else {
-        log(`   URL: ${result.url}`);
-      }
+        log(`→ Filling ${decision.fills.length} field(s)...`);
+        for (const f of decision.fills) {
+          const tag = f.source === "ai_generated" ? "[AI]" : "[demo]";
+          log(`   ${tag} "${f.label ?? f.name ?? f.id}" = "${f.value}"`);
+        }
 
-      setDecision(result);
-      setStatus(`Gemini decided: ${result.action.toUpperCase()}`);
+        const result = await doFillAndSubmit(decision.fills);
+        setSubmitResult(result);
+        setPhase("done");
+        isRunningRef.current = false;
+        log(`✓ Done! Filled ${result.filled}/${decision.fills.length} field(s). Submitted: ${result.submitted ? "YES" : "NO"}`);
+      }
     } catch (err) {
+      isRunningRef.current = false;
+      setPhase("error");
       const msg = err instanceof Error ? err.message : String(err);
-      log(`✗ Error: ${msg}`);
-      setStatus(`Error: ${msg}`);
-    } finally {
-      setLoading(false);
-      log("Analyze complete");
+      log(`✗ ${msg}`);
     }
   }
 
-  function executeDecision() {
-    if (!decision) return;
-
-    if (decision.action === "fill") {
-      log(`→ Sending FILL_FORM (${decision.fills.length} fields)...`);
-      chrome.runtime.sendMessage(
-        { type: "FILL_FORM", fills: decision.fills },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            const msg = chrome.runtime.lastError.message ?? "Unknown error";
-            log(`✗ Fill error: ${msg}`);
-            setActionDone(`Error: ${msg}`);
-            return;
-          }
-          const r = response as { filled?: number };
-          log(`← Fill result: ${r?.filled ?? 0} field(s) filled`);
-          setActionDone(`Filled ${r?.filled ?? 0} field(s).`);
-        },
-      );
-    } else {
-      log(`→ Sending NAVIGATE to: ${decision.url}`);
-      chrome.runtime.sendMessage({ type: "NAVIGATE", url: decision.url }, () => {
-        log("← Navigate sent");
-        setActionDone(`Navigating to: ${decision.url}`);
-      });
-    }
+  async function startAutoApply() {
+    if (!apiKey.trim()) { log("✗ No API key set."); return; }
+    isRunningRef.current = true;
+    navCountRef.current = 0;
+    setSubmitResult(null);
+    setLogs([]);
+    setPhase("running");
+    log("Auto Apply started.");
+    await runCycle();
   }
 
-  // ── Render ──────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────────
 
-  const lines: string[] = [status, ""];
-
-  if (decision) {
-    lines.push(`Action : ${decision.action.toUpperCase()}`);
-    lines.push(`Reason : ${decision.reason}`);
-    lines.push("");
-
-    if (decision.action === "fill") {
-      lines.push(`Fields to fill: ${decision.fills.length}`);
-      for (const f of decision.fills) {
-        const key = f.name ? `name="${f.name}"` : `id="${f.id}"`;
-        lines.push(`  ${key} = "${f.value}"`);
-      }
-    } else {
-      lines.push(`URL: ${decision.url}`);
-    }
-  }
-
-  if (actionDone) {
-    lines.push("", actionDone);
-  }
+  const phaseLabel: Record<Phase, string> = {
+    idle: "",
+    running: `Running... (navigations: ${navCountRef.current}/${MAX_NAV})`,
+    done: "✓ Complete",
+    error: "✗ Stopped with error",
+  };
 
   return (
     <div style={{ fontFamily: "monospace", fontSize: "12px", padding: "8px" }}>
@@ -357,40 +405,46 @@ export default function App() {
         onChange={(e) => saveKey(e.target.value)}
         style={{ width: "100%", boxSizing: "border-box", marginBottom: "6px" }}
       />
-      <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
-        <button onClick={analyze} disabled={loading}>
-          {loading ? "Analyzing..." : "Analyze Page"}
-        </button>
-        {decision && !loading && (
-          <button onClick={executeDecision}>
-            {decision.action === "fill" ? "Fill Form" : "Navigate"}
-          </button>
+
+      <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+        {phase !== "running" ? (
+          <button onClick={startAutoApply}>Auto Apply</button>
+        ) : (
+          <button onClick={stop}>Stop</button>
         )}
         {logs.length > 0 && (
-          <button onClick={() => setLogs([])} style={{ marginLeft: "auto" }}>
-            Clear logs
-          </button>
+          <button onClick={() => setLogs([])}>Clear logs</button>
         )}
       </div>
-      <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", margin: 0 }}>
-        {lines.join("\n")}
-      </pre>
-      {logs.length > 0 && (
-        <div
+
+      {phaseLabel[phase] && (
+        <div style={{ marginBottom: "6px", opacity: 0.8 }}>{phaseLabel[phase]}</div>
+      )}
+
+      {submitResult && (
+        <pre
           style={{
-            marginTop: "10px",
-            borderTop: "1px solid #555",
-            paddingTop: "6px",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-all",
+            margin: "0 0 10px",
+            borderBottom: "1px solid #555",
+            paddingBottom: "8px",
           }}
         >
-          <div style={{ opacity: 0.6, marginBottom: "4px" }}>── LOGS ──</div>
+          {renderReport(submitResult)}
+        </pre>
+      )}
+
+      {logs.length > 0 && (
+        <div>
+          <div style={{ opacity: 0.5, marginBottom: "4px" }}>── LOGS ──</div>
           <pre
             style={{
               fontSize: "10px",
               margin: 0,
               whiteSpace: "pre-wrap",
               wordBreak: "break-all",
-              maxHeight: "200px",
+              maxHeight: "260px",
               overflowY: "auto",
             }}
           >

@@ -15,10 +15,28 @@ type ElementInfo = {
 
 type HiddenInput = { name: string; id?: string; value?: string }
 
-type FillInstruction = { name?: string; id?: string; value: string }
+type FillInstruction = {
+  name?: string
+  id?: string
+  label?: string
+  value: string
+  source?: string
+}
+
+type FillReport = {
+  label: string
+  value: string
+  source: string
+  status: 'filled' | 'failed' | 'not_found'
+}
 
 const JOB_LINK_RE =
   /\b(apply|application|job|career|position|opening|vacancy|hiring|recruit|join.?us|work.?with.?us|opportunities)\b/i
+
+const SUBMIT_RE =
+  /\b(submit|apply|send application|send|finish|complete application|submit application)\b/i
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function getLabel(el: Element): string {
   const get = (a: string) => el.getAttribute(a)?.trim() ?? ''
@@ -77,8 +95,7 @@ function info(el: Element, extra: Partial<ElementInfo> = {}): ElementInfo {
     label: getLabel(el),
     name: el.getAttribute('name') ?? undefined,
     id: el.getAttribute('id') ?? undefined,
-    required:
-      el.hasAttribute('required') || el.getAttribute('aria-required') === 'true',
+    required: el.hasAttribute('required') || el.getAttribute('aria-required') === 'true',
     visible: isVisible(el),
     ...extra,
   }
@@ -86,6 +103,26 @@ function info(el: Element, extra: Partial<ElementInfo> = {}): ElementInfo {
 
 function qAll(sel: string): Element[] {
   return Array.from(document.querySelectorAll(sel))
+}
+
+function getPageText(): string {
+  const container =
+    document.querySelector<HTMLElement>('main, article, [role="main"]') ??
+    document.body
+  return container.innerText.replace(/\s+/g, ' ').trim().slice(0, 3000)
+}
+
+function findSubmitButton(): HTMLElement | null {
+  const explicit = document.querySelector<HTMLElement>(
+    'input[type="submit"], button[type="submit"]',
+  )
+  if (explicit && isVisible(explicit)) return explicit
+
+  return (
+    Array.from(document.querySelectorAll<HTMLElement>('button, input[type="button"]')).find(
+      (btn) => SUBMIT_RE.test(btn.textContent ?? '') && isVisible(btn),
+    ) ?? null
+  )
 }
 
 function fillElement(el: Element, value: string): boolean {
@@ -99,40 +136,35 @@ function fillElement(el: Element, value: string): boolean {
         o.value.toLowerCase() === value.toLowerCase() ||
         o.text.toLowerCase().includes(value.toLowerCase()),
     )
-    if (!option) {
-      console.warn(`[CS] No matching option for select, value="${value}"`)
-      return false
-    }
+    if (!option) { console.warn(`[CS] No matching option for value="${value}"`); return false }
     const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set
     setter?.call(sel, option.value)
     sel.dispatchEvent(new Event('change', { bubbles: true }))
+
   } else if (type === 'checkbox') {
     const cb = el as HTMLInputElement
     const shouldCheck = ['true', '1', 'yes', 'checked', 'on'].includes(value.toLowerCase())
     if (cb.checked !== shouldCheck) cb.click()
+
   } else if (type === 'radio') {
     const name = el.getAttribute('name')
     if (name) {
       try {
-        const radios = document.querySelectorAll<HTMLInputElement>(
-          `input[type="radio"][name="${CSS.escape(name)}"]`,
-        )
-        const target = Array.from(radios).find(
-          (r) => r.value.toLowerCase() === value.toLowerCase(),
-        )
-        if (!target) {
-          console.warn(`[CS] No radio with value="${value}" in group name="${name}"`)
-          return false
-        }
+        const target = Array.from(
+          document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${CSS.escape(name)}"]`),
+        ).find((r) => r.value.toLowerCase() === value.toLowerCase())
+        if (!target) { console.warn(`[CS] No radio value="${value}" in group="${name}"`); return false }
         if (!target.checked) target.click()
       } catch { return false }
     }
+
   } else if (tag === 'textarea') {
     const ta = el as HTMLTextAreaElement
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
     setter?.call(ta, value)
     ta.dispatchEvent(new Event('input', { bubbles: true }))
     ta.dispatchEvent(new Event('change', { bubbles: true }))
+
   } else {
     const input = el as HTMLInputElement
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
@@ -144,12 +176,25 @@ function fillElement(el: Element, value: string): boolean {
   return true
 }
 
+function resolveElement(instr: FillInstruction): Element | null {
+  if (instr.name) {
+    try {
+      const el = document.querySelector(`[name="${CSS.escape(instr.name)}"]`)
+      if (el) return el
+    } catch { /* noop */ }
+  }
+  if (instr.id) return document.getElementById(instr.id)
+  return null
+}
+
+// ── Message listener ───────────────────────────────────────────────────────────
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const type = message.type as string
-  console.log(`[CS] Received message: ${type}`)
+  console.log(`[CS] Message: ${type}`)
 
   if (type === 'GET_JOB_ELEMENTS') {
-    console.log('[CS] Scanning job elements...')
+    console.log('[CS] Scanning...')
 
     const TEXT_TYPES = ['text', 'email', 'tel', 'number', 'url', 'search', 'password']
     const textFields = qAll(
@@ -157,52 +202,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     ).map((el) => info(el))
 
     const DATE_TYPES = ['date', 'datetime-local', 'month', 'week', 'time']
-    const dateFields = qAll(DATE_TYPES.map((t) => `input[type="${t}"]`).join(',')).map(
-      (el) => info(el),
-    )
+    const dateFields = qAll(DATE_TYPES.map((t) => `input[type="${t}"]`).join(',')).map((el) => info(el))
 
     const fileUploads = qAll('input[type="file"]').map((el) =>
       info(el, { value: el.getAttribute('accept') ?? undefined }),
     )
-
     const checkboxes = qAll('input[type="checkbox"]').map((el) =>
       info(el, { value: (el as HTMLInputElement).checked ? 'checked' : 'unchecked' }),
     )
-
     const radios = qAll('input[type="radio"]').map((el) =>
       info(el, { value: (el as HTMLInputElement).value || undefined }),
     )
-
     const dropdowns = qAll('select').map((el) => {
-      const options = Array.from((el as HTMLSelectElement).options)
-        .map((o) => o.text.trim())
-        .filter(Boolean)
+      const options = Array.from((el as HTMLSelectElement).options).map((o) => o.text.trim()).filter(Boolean)
       return { ...info(el), options }
     })
-
     const textareas = qAll('textarea').map((el) => info(el))
 
-    const BUTTON_SEL =
-      'button,input[type="submit"],input[type="button"],input[type="reset"],input[type="image"]'
+    const BUTTON_SEL = 'button,input[type="submit"],input[type="button"],input[type="reset"],input[type="image"]'
     const buttons = qAll(BUTTON_SEL).map((el) =>
-      info(el, {
-        value:
-          ((el as HTMLInputElement).value?.trim() || el.textContent?.trim()) ?? undefined,
-      }),
+      info(el, { value: ((el as HTMLInputElement).value?.trim() || el.textContent?.trim()) ?? undefined }),
     )
-
     const navigationLinks = qAll('a[href]')
-      .filter(
-        (el) =>
-          JOB_LINK_RE.test(el.textContent ?? '') ||
-          JOB_LINK_RE.test((el as HTMLAnchorElement).href),
-      )
-      .map((el) =>
-        info(el, {
-          href: (el as HTMLAnchorElement).href,
-          value: el.textContent?.trim() || undefined,
-        }),
-      )
+      .filter((el) => JOB_LINK_RE.test(el.textContent ?? '') || JOB_LINK_RE.test((el as HTMLAnchorElement).href))
+      .map((el) => info(el, { href: (el as HTMLAnchorElement).href, value: el.textContent?.trim() || undefined }))
 
     const richTextEditors = qAll('[contenteditable="true"]')
       .filter((el) => !['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName))
@@ -221,52 +244,76 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     const categories = {
       textFields, dateFields, fileUploads, checkboxes, radios,
-      dropdowns, textareas, buttons, navigationLinks,
-      richTextEditors, customComponents, hiddenInputs,
+      dropdowns, textareas, buttons, navigationLinks, richTextEditors,
+      customComponents, hiddenInputs,
     }
-
-    const totals = Object.fromEntries(
-      Object.entries(categories).map(([k, v]) => [k, v.length]),
-    )
+    const totals = Object.fromEntries(Object.entries(categories).map(([k, v]) => [k, v.length]))
 
     console.log('[CS] Scan complete:', totals)
-    sendResponse({ url: window.location.href, title: document.title, categories, totals })
+    sendResponse({
+      url: window.location.href,
+      title: document.title,
+      pageText: getPageText(),
+      categories,
+      totals,
+    })
   }
 
-  if (type === 'FILL_FORM') {
+  if (type === 'FILL_AND_SUBMIT') {
     const fills = (message.fills ?? []) as FillInstruction[]
-    console.log(`[CS] FILL_FORM: ${fills.length} instruction(s)`)
-    let filled = 0
+    console.log(`[CS] FILL_AND_SUBMIT: ${fills.length} instructions`)
+    const report: FillReport[] = []
+    let filledCount = 0
 
     for (const instr of fills) {
-      let el: Element | null = null
-
-      if (instr.name) {
-        try {
-          el = document.querySelector(`[name="${CSS.escape(instr.name)}"]`)
-        } catch { /* noop */ }
-      }
-      if (!el && instr.id) {
-        el = document.getElementById(instr.id)
-      }
+      const el = resolveElement(instr)
+      const labelKey = instr.label ?? instr.name ?? instr.id ?? '?'
 
       if (!el) {
-        const key = instr.name ? `name="${instr.name}"` : `id="${instr.id}"`
-        console.warn(`[CS] Element not found: ${key}`)
+        console.warn(`[CS] Not found: ${labelKey}`)
+        report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: 'not_found' })
         continue
       }
 
-      const key = instr.name ? `name="${instr.name}"` : `id="${instr.id}"`
       const ok = fillElement(el, instr.value)
+      report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: ok ? 'filled' : 'failed' })
       if (ok) {
-        console.log(`[CS] ✓ Filled ${key} = "${instr.value}"`)
-        filled++
+        console.log(`[CS] ✓ "${labelKey}" = "${instr.value}" [${instr.source ?? '?'}]`)
+        filledCount++
       } else {
-        console.warn(`[CS] ✗ Failed to fill ${key} = "${instr.value}"`)
+        console.warn(`[CS] ✗ Failed: "${labelKey}"`)
       }
     }
 
-    console.log(`[CS] Fill complete: ${filled}/${fills.length}`)
+    const submitBtn = findSubmitButton()
+    console.log(`[CS] Submit button: ${submitBtn ? `<${submitBtn.tagName.toLowerCase()}> "${submitBtn.textContent?.trim()}"` : 'not found'}`)
+
+    // Send report BEFORE clicking submit — submit may cause page navigation
+    sendResponse({
+      filled: filledCount,
+      submitted: !!submitBtn,
+      report,
+      url: window.location.href,
+      title: document.title,
+    })
+
+    if (submitBtn) {
+      setTimeout(() => {
+        console.log('[CS] Clicking submit...')
+        submitBtn.click()
+      }, 200)
+    }
+  }
+
+  // Legacy fill without submit (kept for compatibility)
+  if (type === 'FILL_FORM') {
+    const fills = (message.fills ?? []) as FillInstruction[]
+    let filled = 0
+    for (const instr of fills) {
+      const el = resolveElement(instr)
+      if (!el) continue
+      if (fillElement(el, instr.value)) filled++
+    }
     sendResponse({ filled })
   }
 
