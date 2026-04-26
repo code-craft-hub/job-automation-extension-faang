@@ -570,49 +570,60 @@ async function uploadResume(input: HTMLInputElement): Promise<boolean> {
     const dt = new DataTransfer()
     dt.items.add(file)
 
-    // Pin our DataTransfer to the `files` getter with defineProperty so that
-    // even if the site calls `input.value = ''` (a common reset pattern that
-    // normally clears the native FileList), reads of `input.files` always
-    // return our file — preventing it from "going away" after React re-renders.
+    // Step A — Direct native assignment.
+    // This sets the browser's internal C++ file-selection slot, which is what
+    // <required> validation reads. Must happen BEFORE any defineProperty override.
+    input.files = dt.files
+
+    // Step B — Pin the JS `files` getter so React reads always return our file
+    // even if a new DataTransfer() is later assigned via input.files = empty.
     try {
       Object.defineProperty(input, 'files', {
         get: () => dt.files,
         configurable: true,
       })
-    } catch {
-      // Fallback if defineProperty is blocked (e.g. already non-configurable)
-      input.files = dt.files
-    }
+    } catch { /* direct assignment in A is still in place */ }
 
-    // Dispatch native DOM events — React 17+ delegates at the root container,
-    // so these reach React's synthetic event system correctly.
+    // Step C — Block `input.value = ''` resets.
+    // Many upload components reset the input after reading the file so the user
+    // can re-pick the same file. That setter call clears the C++ internal slot.
+    // We intercept it on this specific element instance to prevent that.
+    try {
+      const protoValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+      Object.defineProperty(input, 'value', {
+        get: () => 'C:\\fakepath\\John_Doe_Resume.pdf',
+        set: (v: string) => { if (v !== '') protoValue?.set?.call(input, v) },
+        configurable: true,
+      })
+    } catch { /* best-effort */ }
+
+    // Step D — Native DOM events (React 17+ delegates from root container).
     input.dispatchEvent(new Event('change', { bubbles: true }))
     input.dispatchEvent(new Event('input', { bubbles: true }))
 
-    // Also call React's own onChange handler directly when present.
-    // React 17 stores props under __reactProps$<hash>, React 16 under __reactEventHandlers$<hash>.
-    // Calling it directly ensures react-hook-form / formik update their internal state
-    // even when isTrusted=false events are filtered.
+    // Step E — Call React's internal onChange directly.
+    // react-hook-form / formik store props under __reactProps$<hash> (React 17)
+    // or __reactEventHandlers$<hash> (React 16). Calling onChange directly
+    // ensures their internal state reflects the file even if isTrusted=false
+    // events are filtered by the framework.
     const reactKey = Object.keys(input).find(
       (k) => k.startsWith('__reactEventHandlers') || k.startsWith('__reactProps'),
     )
     if (reactKey) {
       const rProps = (input as unknown as Record<string, Record<string, unknown>>)[reactKey]
-      const onChange = rProps?.onChange
-      if (typeof onChange === 'function') {
-        onChange({
+      if (typeof rProps?.onChange === 'function') {
+        ;(rProps.onChange as (e: unknown) => void)({
           target: input, currentTarget: input, type: 'change',
           bubbles: true, cancelable: true, isTrusted: false,
           preventDefault: () => {}, stopPropagation: () => {},
         })
-        console.log('[CS] ✓ Resume: React internal onChange called')
+        console.log('[CS] ✓ Resume: React internal onChange fired')
       }
     }
 
-    // Wait for any async upload flow (e.g. Workable's presign → S3 PUT) to settle
-    // before we move on to filling other fields that might trigger re-renders.
+    // Wait for async upload flows (e.g. Workable presign → S3 PUT) to settle.
     await delay(800)
-    console.log('[CS] ✓ Resume uploaded to file input')
+    console.log(`[CS] ✓ Resume set on "${getLabel(input) || 'file input'}" (files: ${dt.files.length})`)
     return true
   } catch (e) {
     console.warn('[CS] Resume upload error:', e)
@@ -1248,6 +1259,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         console.log(`[CS] Clicking section save: "${btn.textContent?.trim()}"`)
         btn.click()
         await delay(300)
+      }
+
+      // ── 3.5. Re-verify file inputs — React may have remounted them ─────────────
+      // The fill pass and dropdown interactions trigger re-renders. If the site's
+      // React component remounts the file input (new DOM element, fresh key prop),
+      // the resume upload from step 0 is lost. Re-scan here and re-upload any
+      // empty resume inputs so native <required> validation sees a file on submit.
+      {
+        const shadowFiles = (queryShadow('input[type="file"]') as HTMLInputElement[])
+          .filter(el => !document.contains(el))
+        const allFileInputs = [
+          ...Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')),
+          ...shadowFiles,
+        ].filter(isResumeInput)
+        for (const fi of allFileInputs) {
+          if ((fi.files?.length ?? 0) === 0) {
+            console.warn(`[CS] Resume empty after fills — re-uploading to "${getLabel(fi) || 'file input'}"`)
+            await uploadResume(fi)
+          }
+        }
       }
 
       // ── 4. Scan still-unfilled required fields ──────────────────────────────
