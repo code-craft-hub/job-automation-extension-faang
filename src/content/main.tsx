@@ -227,6 +227,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .filter((el) => JOB_LINK_RE.test(el.textContent ?? '') || JOB_LINK_RE.test((el as HTMLAnchorElement).href))
       .map((el) => info(el, { href: (el as HTMLAnchorElement).href, value: el.textContent?.trim() || undefined }))
 
+    const APPLY_RE = /\b(apply|apply now|apply for this job|start application|begin application)\b/i
+    const applyButtons = [
+      ...qAll('button').filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
+      ...qAll('a[href]').filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
+    ].map((el) => info(el, {
+      href: el.tagName === 'A' ? (el as HTMLAnchorElement).href : undefined,
+      value: el.textContent?.trim() || (el as HTMLInputElement).value?.trim() || undefined,
+    }))
+
     const richTextEditors = qAll('[contenteditable="true"]')
       .filter((el) => !['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName))
       .map((el) => info(el))
@@ -244,7 +253,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     const categories = {
       textFields, dateFields, fileUploads, checkboxes, radios,
-      dropdowns, textareas, buttons, navigationLinks, richTextEditors,
+      dropdowns, textareas, buttons, navigationLinks, applyButtons, richTextEditors,
       customComponents, hiddenInputs,
     }
     const totals = Object.fromEntries(Object.entries(categories).map(([k, v]) => [k, v.length]))
@@ -302,6 +311,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         console.log('[CS] Clicking submit...')
         submitBtn.click()
       }, 200)
+    }
+  }
+
+  if (type === 'CLICK_BUTTON') {
+    const text = (message.buttonText ?? '') as string
+    const APPLY_RE = /\b(apply|apply now|apply for this job|start application|begin application)\b/i
+    const btn = [
+      ...Array.from(document.querySelectorAll<HTMLElement>('button')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
+      ...Array.from(document.querySelectorAll<HTMLElement>('a[href]')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
+    ].find((el) => !text || el.textContent?.trim().toLowerCase().includes(text.toLowerCase()))
+    if (btn) {
+      sendResponse({ clicked: true })
+      setTimeout(() => btn.click(), 100)
+    } else {
+      sendResponse({ clicked: false, error: 'Button not found' })
     }
   }
 

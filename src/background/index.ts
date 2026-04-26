@@ -1,10 +1,22 @@
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
 // Relay these message types straight through to the active tab's content script
-const RELAY_TO_CONTENT = new Set(['GET_JOB_ELEMENTS', 'FILL_FORM', 'FILL_AND_SUBMIT'])
+const RELAY_TO_CONTENT = new Set(['GET_JOB_ELEMENTS', 'FILL_FORM', 'FILL_AND_SUBMIT', 'CLICK_BUTTON'])
 
 // Track which tab we navigated so we know when it finishes loading
 let watchedTabId: number | null = null
+let watchedOpenerTabId: number | null = null
+
+// If "Apply now" opens a new tab, start watching that tab instead
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.openerTabId != null && tab.openerTabId === watchedOpenerTabId && tab.id != null) {
+    console.log(`[BG] New tab ${tab.id} opened from watched tab ${tab.openerTabId} — switching watch`)
+    watchedTabId = tab.id
+    watchedOpenerTabId = null
+    // Focus new tab so the side panel stays associated with it
+    chrome.tabs.update(tab.id, { active: true })
+  }
+})
 
 // When the watched tab finishes loading, tell the side panel to re-analyze
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -87,9 +99,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tabId = tabs[0]?.id
       if (tabId && url) {
-        watchedTabId = tabId // start watching this tab
+        watchedTabId = tabId
+        watchedOpenerTabId = null
         chrome.tabs.update(tabId, { url })
         console.log(`[BG] Tab ${tabId} navigating, now watching for load...`)
+      }
+      sendResponse({})
+    })
+    return true
+  }
+
+  if (type === 'WATCH_FOR_NEW_TAB') {
+    // Side panel tells us a click may open a new tab — watch for it
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tabId = tabs[0]?.id
+      if (tabId) {
+        watchedOpenerTabId = tabId
+        watchedTabId = null
+        console.log(`[BG] Watching tab ${tabId} for child tab creation`)
       }
       sendResponse({})
     })

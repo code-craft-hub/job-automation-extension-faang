@@ -28,6 +28,7 @@ type JobData = {
     textareas: FieldInfo[];
     buttons: FieldInfo[];
     navigationLinks: FieldInfo[];
+    applyButtons: FieldInfo[];
     richTextEditors: FieldInfo[];
     customComponents: FieldInfo[];
     hiddenInputs: FieldInfo[];
@@ -44,7 +45,8 @@ type FillInstruction = {
 
 type Decision =
   | { action: "fill"; reason: string; fills: FillInstruction[] }
-  | { action: "navigate"; reason: string; url: string };
+  | { action: "navigate"; reason: string; url: string }
+  | { action: "click"; reason: string; buttonText: string };
 
 type FillReportItem = {
   label: string;
@@ -122,7 +124,11 @@ function buildPrompt(data: JobData): string {
       dropdowns: data.categories.dropdowns.filter(visible).map((f) => ({ label: f.label, name: f.name, options: f.options?.slice(0, 8) })),
       textareas: data.categories.textareas.filter(visible).map((f) => ({ label: f.label, name: f.name, id: f.id, required: f.required })),
     },
-    navigationLinks: data.categories.navigationLinks.slice(0, 10).map((f) => ({
+    applyButtons: data.categories.applyButtons.map((f) => ({
+      text: f.value,
+      href: f.href ?? null,
+    })),
+    navigationLinks: data.categories.navigationLinks.map((f) => ({
       text: f.value,
       href: f.href,
     })),
@@ -146,13 +152,21 @@ TASK — decide ONE action:
    - For fields NOT covered by demo user data (e.g. "Why do you want this role?", "Describe your experience with X", specific skill assessments), generate a realistic, relevant answer based on the job page context and the user's background (source: "ai_generated")
    - Every fill must include: name or id, label (human-readable field name), value, source
 
-2. "navigate" — if this is a job listing/description page, OR if visible inputs are just a search bar / email subscription form (not an application).
-   - Choose the single best URL from navigationLinks that leads to a job application form.
+2. "click" — HIGHEST PRIORITY if applyButtons is non-empty. This means there is a visible "Apply now" or similar button on the page. Click it to reach the application form.
+   - Use the text of the button as buttonText.
 
-Key rule: If the page shows a job description with qualifications and "how to apply" instructions but no real application form fields → choose "navigate".
+3. "navigate" — if this is a job listing/description page with NO applyButtons, OR if visible inputs are just a search bar / email subscription form (not an application).
+   - Choose the single best URL from navigationLinks that leads to a job application form.
+   - ONLY use a URL that actually appears in navigationLinks. If no suitable URL exists, use the "click" action instead.
+
+Key rules:
+- If applyButtons is non-empty → always choose "click" first.
+- If the page shows a job description with no real application form fields and no applyButtons → choose "navigate" only with a real URL from navigationLinks.
+- NEVER return null or a made-up URL.
 
 Respond with ONLY valid JSON, no markdown:
 Fill: {"action":"fill","reason":"...","fills":[{"name":"fn","label":"First Name","value":"John","source":"demo_user"},...]}
+Click: {"action":"click","reason":"...","buttonText":"Apply now"}
 Navigate: {"action":"navigate","reason":"...","url":"https://..."}`;
 }
 
@@ -349,11 +363,24 @@ export default function App() {
         if (navCountRef.current >= MAX_NAV) {
           throw new Error(`Reached max ${MAX_NAV} navigations without finding a form.`);
         }
+        const url = decision.url;
+        if (!url || url === "null") {
+          throw new Error("Gemini returned no valid URL to navigate to.");
+        }
         navCountRef.current++;
-        log(`→ Navigating [${navCountRef.current}/${MAX_NAV}]: ${decision.url}`);
-        // Navigate — background watches the tab and sends TAB_READY when loaded
-        chrome.runtime.sendMessage({ type: "NAVIGATE", url: decision.url });
-        // runCycle will be called again by the TAB_READY listener
+        log(`→ Navigating [${navCountRef.current}/${MAX_NAV}]: ${url}`);
+        chrome.runtime.sendMessage({ type: "NAVIGATE", url });
+
+      } else if (decision.action === "click") {
+        if (navCountRef.current >= MAX_NAV) {
+          throw new Error(`Reached max ${MAX_NAV} navigations without finding a form.`);
+        }
+        navCountRef.current++;
+        log(`→ Clicking button [${navCountRef.current}/${MAX_NAV}]: "${decision.buttonText}"`);
+        // Tell background to watch for a new tab (Apply may open in a new tab)
+        chrome.runtime.sendMessage({ type: "WATCH_FOR_NEW_TAB" });
+        chrome.runtime.sendMessage({ type: "CLICK_BUTTON", buttonText: decision.buttonText });
+        // TAB_READY will fire when page/new tab finishes loading
 
       } else {
         log(`→ Filling ${decision.fills.length} field(s)...`);
