@@ -27,7 +27,7 @@ type FillReport = {
   label: string
   value: string
   source: string
-  status: 'filled' | 'failed' | 'not_found'
+  status: 'filled' | 'failed' | 'not_found' | 'async'
 }
 
 type UnfilledField = {
@@ -48,6 +48,10 @@ const CONTINUE_RE =
   /\b(continue|next|next step|save and continue|save & continue|proceed|go to next)\b/i
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
 function getLabel(el: Element): string {
   const get = (a: string) => el.getAttribute(a)?.trim() ?? ''
@@ -101,7 +105,6 @@ function isVisible(el: Element): boolean {
 
 function isRequiredEl(el: Element): boolean {
   if (el.hasAttribute('required') || el.getAttribute('aria-required') === 'true') return true
-  // Many ATS (Workable etc.) mark required with * in the label text
   return /\*/.test(getLabel(el))
 }
 
@@ -146,16 +149,152 @@ function findActionButton(): { btn: HTMLElement; isFinal: boolean } | null {
   if (finalBtn) return { btn: finalBtn, isFinal: true }
   if (continueBtn) return { btn: continueBtn, isFinal: false }
 
-  // Fallback: any explicit type="submit" that isn't labeled as continue
   const explicit = candidates.find(
     (b) => b.getAttribute('type') === 'submit' && !CONTINUE_RE.test(b.textContent?.trim() ?? ''),
   )
   return explicit ? { btn: explicit, isFinal: true } : null
 }
 
-function fillElement(el: Element, value: string): boolean {
+// ── Custom dropdown detection ──────────────────────────────────────────────────
+
+// Returns true when the element (or its close ancestor) is a custom React/JS dropdown,
+// not a native <select>.  These need a click sequence to open + pick an option.
+function isCustomDropdown(el: Element): boolean {
+  const tag = el.tagName.toLowerCase()
+  if (tag === 'select' || tag === 'textarea' || tag === 'button') return false
+
+  // Non-input element with combobox/listbox role → definitely custom
+  if (tag !== 'input') {
+    const role = el.getAttribute('role')
+    if (role === 'combobox' || role === 'listbox') return true
+    if (el.hasAttribute('aria-haspopup')) return true
+  }
+
+  // Input that is read-only inside a styled container → custom select
+  if (tag === 'input' && (el as HTMLInputElement).readOnly) {
+    return !!(
+      el.closest('[role="combobox"]') ||
+      el.closest('[aria-haspopup]') ||
+      el.closest('[class*="select"]') ||
+      el.closest('[class*="Select"]') ||
+      el.closest('[class*="dropdown"]') ||
+      el.closest('[class*="Dropdown"]')
+    )
+  }
+
+  return false
+}
+
+// Clicks a custom dropdown container, waits for options to render, clicks the match.
+async function fillCustomDropdown(el: Element, value: string): Promise<boolean> {
+  // Find the best trigger element (the visible clickable part of the dropdown)
+  const container =
+    el.closest('[role="combobox"]') ??
+    el.closest('[aria-haspopup]') ??
+    el.closest('[class*="select"]') ??
+    el.closest('[class*="Select"]') ??
+    el.parentElement ??
+    el
+
+  const trigger = (
+    (container !== el && isVisible(container) ? container : null) ??
+    el
+  ) as HTMLElement
+
+  // Open the dropdown
+  trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+  trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+  trigger.click()
+  trigger.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
+
+  await delay(450)
+
+  const needle = value.toLowerCase().trim()
+  const OPTION_SEL = [
+    '[role="option"]',
+    '[role="menuitem"]',
+    '[class*="option"]',
+    '[class*="Option"]',
+    '[class*="item"]',
+    'li',
+  ].join(',')
+
+  // 1. Search near the trigger first (less likely to hit a different open dropdown)
+  const nearAncestor =
+    trigger.closest('[role="listbox"]') ??
+    trigger.parentElement?.querySelector('[role="listbox"]') ??
+    trigger.parentElement?.parentElement?.querySelector('[role="listbox"]') ??
+    trigger.parentElement
+
+  if (nearAncestor) {
+    for (const opt of Array.from(nearAncestor.querySelectorAll<HTMLElement>(OPTION_SEL))) {
+      if (!isVisible(opt)) continue
+      const txt = opt.textContent?.trim().toLowerCase() ?? ''
+      const dataVal = (opt.getAttribute('data-value') ?? '').toLowerCase()
+      if (txt === needle || txt.includes(needle) || dataVal === needle) {
+        opt.click()
+        console.log(`[CS] ✓ Custom dropdown (nearby): "${opt.textContent?.trim()}"`)
+        await delay(150)
+        return true
+      }
+    }
+  }
+
+  // 2. Global scan for any visible option matching the value
+  for (const opt of Array.from(document.querySelectorAll<HTMLElement>(OPTION_SEL))) {
+    if (!isVisible(opt)) continue
+    const txt = opt.textContent?.trim().toLowerCase() ?? ''
+    const dataVal = (opt.getAttribute('data-value') ?? '').toLowerCase()
+    if (txt === needle || txt.includes(needle) || dataVal === needle) {
+      opt.click()
+      console.log(`[CS] ✓ Custom dropdown (global): "${opt.textContent?.trim()}"`)
+      await delay(150)
+      return true
+    }
+  }
+
+  // Close the dropdown if nothing matched
+  trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  console.warn(`[CS] Custom dropdown: no option matching "${value}"`)
+  return false
+}
+
+// ── Phone field helpers ────────────────────────────────────────────────────────
+
+// True when a phone text input is part of a split field (country selector + number).
+function hasCountrySelector(el: Element): boolean {
+  const parent = el.parentElement
+  const ancestor = el.closest('[class*="phone"], [class*="Phone"], [class*="tel"], .iti')
+  const scope = ancestor ?? parent
+
+  if (!scope) return false
+  return !!(
+    scope.querySelector('.iti__flag, .iti__flag-box, [class*="flag"]') ||
+    scope.querySelector('[class*="country-code"], [class*="CountryCode"], [class*="countryCode"]') ||
+    scope.querySelector('[class*="phone-code"], [class*="phoneCode"]') ||
+    (scope.querySelector('select') && scope.querySelector('select') !== el) ||
+    (scope.querySelector('[role="combobox"]') && scope.querySelector('[role="combobox"]') !== el)
+  )
+}
+
+// Strip leading country code (+1, +44, +234 …) from a phone string.
+function stripCountryCode(phone: string): string {
+  return phone
+    .replace(/^\+\d{1,3}[-\s]?/, '')   // +XX or +XXX
+    .replace(/^00\d{1,3}[-\s]?/, '')   // 00XX
+    .trim()
+}
+
+// ── Fill element ───────────────────────────────────────────────────────────────
+
+// Returns true on success, false on failure, 'custom' when async dropdown handling is needed.
+function fillElement(el: Element, value: string): boolean | 'custom' {
   const tag = el.tagName.toLowerCase()
   const type = el.getAttribute('type')?.toLowerCase()
+
+  // Custom dropdown — caller must use fillCustomDropdown() instead
+  if (isCustomDropdown(el)) return 'custom'
+
   let filled = false
 
   if (tag === 'select') {
@@ -199,15 +338,18 @@ function fillElement(el: Element, value: string): boolean {
     filled = true
 
   } else {
+    // Standard text / email / tel / number input
     const input = el as HTMLInputElement
+    const isPhone = type === 'tel' || /phone|mobile|telephone/i.test(getLabel(el))
+    const fillValue = (isPhone && hasCountrySelector(el)) ? stripCountryCode(value) : value
+
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
-    setter?.call(input, value)
+    setter?.call(input, fillValue)
     input.dispatchEvent(new Event('input', { bubbles: true }))
     input.dispatchEvent(new Event('change', { bubbles: true }))
     filled = true
   }
 
-  // Trigger validation events so the form framework knows the field was touched
   if (filled) {
     el.dispatchEvent(new Event('blur', { bubbles: true }))
     el.dispatchEvent(new Event('focusout', { bubbles: true }))
@@ -215,6 +357,8 @@ function fillElement(el: Element, value: string): boolean {
 
   return filled
 }
+
+// ── Resolve element ────────────────────────────────────────────────────────────
 
 function resolveElement(instr: FillInstruction): Element | null {
   if (instr.name) {
@@ -227,7 +371,7 @@ function resolveElement(instr: FillInstruction): Element | null {
     const el = document.getElementById(instr.id)
     if (el) return el
   }
-  // Label-text fallback — finds the associated form control for a matching label
+  // Label-text fallback
   if (instr.label) {
     const needle = instr.label.toLowerCase().replace(/[*\s]+/g, ' ').trim()
     for (const lbl of Array.from(document.querySelectorAll<HTMLElement>('label'))) {
@@ -238,14 +382,20 @@ function resolveElement(instr: FillInstruction): Element | null {
         const el = document.getElementById(forId)
         if (el) return el
       }
-      const nested = lbl.querySelector('input, select, textarea')
+      const nested = lbl.querySelector('input, select, textarea, [role="combobox"]')
       if (nested) return nested
+    }
+    // Also try matching by placeholder or aria-label on inputs
+    for (const el of qAll('input, select, textarea, [role="combobox"]')) {
+      const lbl2 = getLabel(el).toLowerCase().replace(/[*\s]+/g, ' ').trim()
+      if (lbl2 && (lbl2.includes(needle) || needle.includes(lbl2))) return el
     }
   }
   return null
 }
 
-// Returns all required form fields that are still empty or in an error state.
+// ── Unfilled required fields scan ─────────────────────────────────────────────
+
 function getUnfilledRequired(): UnfilledField[] {
   const result: UnfilledField[] = []
   const seen = new Set<string>()
@@ -275,20 +425,29 @@ function getUnfilledRequired(): UnfilledField[] {
     }
   }
 
-  // Selects
+  // Native selects
   for (const el of qAll('select')) {
     if (!isVisible(el)) continue
     const sel = el as HTMLSelectElement
     if (isRequiredEl(el) && (!sel.value || sel.selectedIndex <= 0)) {
-      const options = Array.from(sel.options)
-        .slice(1)
-        .map((o) => o.value || o.text.trim())
-        .filter(Boolean)
+      const options = Array.from(sel.options).slice(1).map((o) => o.value || o.text.trim()).filter(Boolean)
       add({ label: getLabel(el), name: sel.name || undefined, id: sel.id || undefined, type: 'select', options })
     }
   }
 
-  // Radio groups — report once per group
+  // Custom combobox / dropdown components (read-only inputs or role=combobox divs)
+  for (const el of qAll('[role="combobox"], input[readonly]')) {
+    if (!isVisible(el)) continue
+    if (!isRequiredEl(el)) continue
+    const val = (el as HTMLInputElement).value?.trim() ?? el.textContent?.trim() ?? ''
+    if (!val || val.toLowerCase().startsWith('select')) {
+      const id = el.getAttribute('id') || undefined
+      const name = el.getAttribute('name') || undefined
+      add({ label: getLabel(el), name, id, type: 'custom_select' })
+    }
+  }
+
+  // Radio groups
   const radioGroups = new Map<string, HTMLInputElement[]>()
   for (const el of qAll('input[type="radio"]')) {
     const r = el as HTMLInputElement
@@ -309,7 +468,7 @@ function getUnfilledRequired(): UnfilledField[] {
     })
   }
 
-  // Fields in error state (aria-invalid)
+  // Fields in aria-invalid error state
   for (const el of qAll('[aria-invalid="true"]')) {
     if (!isVisible(el)) continue
     const name = el.getAttribute('name') || undefined
@@ -402,61 +561,93 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (type === 'FILL_AND_SUBMIT') {
-    const fills = (message.fills ?? []) as FillInstruction[]
-    const submitForm = message.submitForm !== false  // default: true
-    console.log(`[CS] FILL_AND_SUBMIT: ${fills.length} instructions, submitForm=${submitForm}`)
-    const report: FillReport[] = []
-    let filledCount = 0
+    // Async handler — return true below keeps the channel open until sendResponse is called.
+    ;(async () => {
+      const fills = (message.fills ?? []) as FillInstruction[]
+      const submitForm = message.submitForm !== false
+      console.log(`[CS] FILL_AND_SUBMIT: ${fills.length} fills, submitForm=${submitForm}`)
 
-    for (const instr of fills) {
-      const el = resolveElement(instr)
-      const labelKey = instr.label ?? instr.name ?? instr.id ?? '?'
+      const report: FillReport[] = []
+      let filledCount = 0
+      const customQueue: { el: Element; value: string; label: string; source: string }[] = []
 
-      if (!el) {
-        console.warn(`[CS] Not found: ${labelKey}`)
-        report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: 'not_found' })
-        continue
+      // ── Sync fill pass ─────────────────────────────────────────────────────
+      for (const instr of fills) {
+        const el = resolveElement(instr)
+        const labelKey = instr.label ?? instr.name ?? instr.id ?? '?'
+
+        if (!el) {
+          console.warn(`[CS] Not found: ${labelKey}`)
+          report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: 'not_found' })
+          continue
+        }
+
+        const result = fillElement(el, instr.value)
+
+        if (result === 'custom') {
+          // Queue for async click-based fill
+          customQueue.push({ el, value: instr.value, label: labelKey, source: instr.source ?? 'unknown' })
+          report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: 'async' })
+          filledCount++ // optimistic; will be corrected below if it fails
+        } else if (result) {
+          console.log(`[CS] ✓ "${labelKey}" = "${instr.value}" [${instr.source ?? '?'}]`)
+          report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: 'filled' })
+          filledCount++
+        } else {
+          console.warn(`[CS] ✗ Failed: "${labelKey}"`)
+          report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: 'failed' })
+        }
       }
 
-      const ok = fillElement(el, instr.value)
-      report.push({ label: labelKey, value: instr.value, source: instr.source ?? 'unknown', status: ok ? 'filled' : 'failed' })
-      if (ok) {
-        console.log(`[CS] ✓ "${labelKey}" = "${instr.value}" [${instr.source ?? '?'}]`)
-        filledCount++
-      } else {
-        console.warn(`[CS] ✗ Failed: "${labelKey}"`)
+      // ── Async custom dropdown pass ──────────────────────────────────────────
+      if (customQueue.length > 0) {
+        console.log(`[CS] Async custom dropdown fills: ${customQueue.length}`)
+        for (const item of customQueue) {
+          const ok = await fillCustomDropdown(item.el, item.value)
+          if (!ok) {
+            // Mark as failed in the report
+            const entry = report.find((r) => r.label === item.label && r.status === 'async')
+            if (entry) { entry.status = 'failed'; filledCount-- }
+          } else {
+            const entry = report.find((r) => r.label === item.label && r.status === 'async')
+            if (entry) entry.status = 'filled'
+            console.log(`[CS] ✓ Custom dropdown "${item.label}" = "${item.value}"`)
+          }
+        }
+        // Give React a moment to update state before scanning for unfilled fields
+        await delay(300)
       }
-    }
 
-    // Scan for required fields still empty/errored after filling
-    const unfilledRequired = getUnfilledRequired()
-    if (unfilledRequired.length > 0) {
-      console.log(`[CS] Unfilled required fields (${unfilledRequired.length}):`, unfilledRequired.map(f => f.label))
-    }
+      // ── Scan for still-unfilled required fields ────────────────────────────
+      const unfilledRequired = getUnfilledRequired()
+      if (unfilledRequired.length > 0) {
+        console.log(`[CS] Unfilled required (${unfilledRequired.length}):`, unfilledRequired.map((f) => f.label))
+      }
 
-    const action = submitForm ? findActionButton() : null
-    const pageAction = action ? (action.isFinal ? 'submitted' : 'continued') : 'none'
-    if (submitForm) {
-      console.log(`[CS] Action button: ${action ? `"${action.btn.textContent?.trim()}" isFinal=${action.isFinal}` : 'not found'}`)
-    }
+      const action = submitForm ? findActionButton() : null
+      const pageAction = action ? (action.isFinal ? 'submitted' : 'continued') : 'none'
+      if (submitForm) {
+        console.log(`[CS] Action button: ${action ? `"${action.btn.textContent?.trim()}" isFinal=${action.isFinal}` : 'not found'}`)
+      }
 
-    // Send report BEFORE clicking — clicking may cause page navigation
-    sendResponse({
-      filled: filledCount,
-      submitted: action?.isFinal ?? false,
-      pageAction,
-      report,
-      url: window.location.href,
-      title: document.title,
-      unfilledRequired,
-    })
+      // Send report BEFORE clicking — clicking may cause navigation
+      sendResponse({
+        filled: filledCount,
+        submitted: action?.isFinal ?? false,
+        pageAction,
+        report,
+        url: window.location.href,
+        title: document.title,
+        unfilledRequired,
+      })
 
-    if (action) {
-      setTimeout(() => {
-        console.log(`[CS] Clicking ${action.isFinal ? 'submit' : 'continue'}...`)
-        action.btn.click()
-      }, 200)
-    }
+      if (action) {
+        setTimeout(() => {
+          console.log(`[CS] Clicking ${action.isFinal ? 'submit' : 'continue'}...`)
+          action.btn.click()
+        }, 200)
+      }
+    })()
   }
 
   if (type === 'CLICK_BUTTON') {
@@ -464,8 +655,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const APPLY_RE = /\b(apply|apply now|apply for this job|start application|begin application)\b/i
     const LINKEDIN_RE = /linkedin/i
 
-    // Strategy 1: many ATS sites embed the real apply href in the DOM before the dropdown
-    // is toggled open (the link is just hidden by CSS). Navigate directly — no clicking needed.
     const directHref = (() => {
       for (const a of Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))) {
         const txt = (a.textContent?.trim() ?? '').replace(/[\s»›→»?⟩]+$/, '').trim()
@@ -474,22 +663,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (!href || href.endsWith('#') || href.startsWith('javascript') || href === window.location.href) continue
         try {
           const path = new URL(href).pathname
-          // Only accept if the path contains apply/application/candidate keywords
-          // OR the element is currently hidden (it's a dropdown-only link)
-          if (/apply|application|candidate|talentcommunity/i.test(path) || !isVisible(a)) {
-            return href
-          }
+          if (/apply|application|candidate|talentcommunity/i.test(path) || !isVisible(a)) return href
         } catch { /* invalid URL — skip */ }
       }
       return null
     })()
 
     if (directHref) {
-      console.log(`[CS] Direct apply href found — navigating: ${directHref}`)
+      console.log(`[CS] Direct apply href — navigating: ${directHref}`)
       sendResponse({ clicked: true })
       setTimeout(() => { window.location.href = directHref }, 100)
     } else {
-      // Strategy 2: click the visible toggle and auto-click the dropdown item after it opens
       const btn = [
         ...Array.from(document.querySelectorAll<HTMLElement>('button')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
         ...Array.from(document.querySelectorAll<HTMLElement>('a[href]')).filter((el) => APPLY_RE.test(el.textContent ?? '') && isVisible(el)),
@@ -499,7 +683,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({ clicked: true })
         setTimeout(() => {
           btn.click()
-          // After the click, detect if a dropdown opened and click the direct apply option
           setTimeout(() => {
             const DROPDOWN_SEL = [
               '[role="menu"]', '[role="listbox"]', '[role="dialog"]',
@@ -510,8 +693,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             ].join(',')
 
             let target: HTMLElement | null = null
-
-            // Search inside visible dropdown containers
             for (const container of Array.from(document.querySelectorAll<HTMLElement>(DROPDOWN_SEL))) {
               if (!isVisible(container)) continue
               const item = Array.from(
@@ -522,7 +703,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
               if (item) { target = item; break }
             }
 
-            // Fallback: any newly visible apply link/button (not the toggle, not LinkedIn)
             if (!target) {
               target = [
                 ...Array.from(document.querySelectorAll<HTMLElement>('a[href]'))
@@ -533,13 +713,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             }
 
             if (target) {
-              // Prefer navigating via href if target is a link, otherwise click
               const targetHref = (target as HTMLAnchorElement).href
               if (targetHref && !targetHref.endsWith('#') && !targetHref.startsWith('javascript')) {
-                console.log(`[CS] Dropdown apply link — navigating: ${targetHref}`)
                 window.location.href = targetHref
               } else {
-                console.log(`[CS] Dropdown apply button — clicking: "${target.textContent?.trim()}"`)
                 target.click()
               }
             }
@@ -551,14 +728,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
   }
 
-  // Legacy fill without submit (kept for compatibility)
+  // Legacy fill without submit
   if (type === 'FILL_FORM') {
     const fills = (message.fills ?? []) as FillInstruction[]
     let filled = 0
     for (const instr of fills) {
       const el = resolveElement(instr)
       if (!el) continue
-      if (fillElement(el, instr.value)) filled++
+      const result = fillElement(el, instr.value)
+      if (result === true) filled++
     }
     sendResponse({ filled })
   }

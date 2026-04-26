@@ -80,7 +80,7 @@ const DEMO_USER = {
   lastName: "Doe",
   fullName: "John Doe",
   email: "john.doe@example.com",
-  phone: "+1-555-0100",
+  phone: "+16502831234",
   address: "123 Main Street",
   city: "San Francisco",
   state: "California",
