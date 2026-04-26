@@ -306,6 +306,70 @@ function clickOption(opt: HTMLElement): void {
   opt.click()
 }
 
+// Select a single [role="radio"] option inside an ARIA radiogroup.
+//
+// Google Forms renders radio buttons as <div role="radio" jsaction="click:cOuCgd"> elements
+// (not native <input type="radio">). The event handler is registered directly on the div via
+// jsaction, not on the wrapping <label>. Key rules:
+//   1. Click the [role="radio"] div DIRECTLY — clicking the <label for="..."> only focuses
+//      the div (browser native label→control redirect), it does NOT fire the jsaction handler.
+//   2. Use realistic MouseEvent parameters (view, clientX/Y) so the jsaction dispatcher
+//      recognises the event as a valid UI interaction.
+//   3. Space-keydown backup: jsaction also maps keydown → I481le (Space/Enter handler).
+//   4. Directly set aria-checked as a guaranteed visual fallback.
+//   5. Walk the DOM to find the hidden submission field (Google Forms stores the selected
+//      value in a hidden <textarea name="entry.XXXXXXXX"> for traditional form submit).
+function clickAriaRadio(allOpts: HTMLElement[], target: HTMLElement, groupLabel: string): void {
+  const dataValue = target.getAttribute('data-value') ?? target.getAttribute('aria-label') ?? target.textContent?.trim() ?? ''
+
+  // 1 — Scroll into view so getBoundingClientRect returns valid viewport coords
+  try { target.scrollIntoView({ block: 'nearest', behavior: 'instant' as ScrollBehavior }) } catch { /* noop */ }
+
+  // 2 — Focus (needed for keyboard events to be processed by the controller)
+  try { target.focus() } catch { /* noop */ }
+
+  // 3 — Realistic mouse event sequence on the [role="radio"] div itself
+  const rect = target.getBoundingClientRect()
+  const cx = Math.round(rect.left + rect.width  / 2)
+  const cy = Math.round(rect.top  + rect.height / 2)
+  const base: MouseEventInit = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0 }
+  target.dispatchEvent(new MouseEvent('mouseenter', { ...base, buttons: 0 }))
+  target.dispatchEvent(new MouseEvent('mouseover',  { ...base, buttons: 0 }))
+  target.dispatchEvent(new MouseEvent('mousedown',  { ...base, buttons: 1 }))
+  target.dispatchEvent(new MouseEvent('mouseup',    { ...base, buttons: 0 }))
+  target.dispatchEvent(new MouseEvent('click',      { ...base, buttons: 0 }))
+
+  // 4 — Keyboard Space fallback (jsaction keydown:I481le is the Space/Enter handler)
+  const kbd = (type: string) => target.dispatchEvent(new KeyboardEvent(type, {
+    key: ' ', code: 'Space', keyCode: 32, which: 32, bubbles: true, cancelable: true, view: window,
+  }))
+  kbd('keydown')
+  kbd('keyup')
+
+  // 5 — Directly set aria-checked (guaranteed visual update even if jsaction didn't fire)
+  allOpts.forEach(r => r.setAttribute('aria-checked', 'false'))
+  target.setAttribute('aria-checked', 'true')
+
+  // 6 — Update hidden submission field if present.
+  // Google Forms stores the selection in a hidden <textarea name="entry.XXXXXXXXX">
+  // that lives somewhere in the question's ancestor container.
+  let container: Element | null = target.parentElement
+  for (let depth = 0; depth < 10 && container; depth++) {
+    const field = container.querySelector<HTMLElement>('textarea[name^="entry."], input[type="hidden"][name^="entry."]')
+    if (field) {
+      const proto = field.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+      setter?.call(field, dataValue)
+      field.dispatchEvent(new Event('change', { bubbles: true }))
+      console.log(`[CS] ARIA radio "${groupLabel}": hidden field "${(field as HTMLInputElement).name}" = "${dataValue}"`)
+      break
+    }
+    container = container.parentElement
+  }
+
+  console.log(`[CS] ✓ ARIA radio "${groupLabel}": "${dataValue}"`)
+}
+
 // Collect all visible option-like elements currently in the DOM.
 function collectVisibleOptions(): HTMLElement[] {
   const OPTION_SEL = [
@@ -681,31 +745,7 @@ function fillElement(el: Element, value: string): boolean | 'custom' {
       return t === needle || t.includes(needle) || needle.includes(t)
     })
     if (target) {
-      // Focus first — required for keyboard-driven ARIA implementations
-      try { target.focus() } catch { /* noop */ }
-
-      // Google Forms wraps each [role="radio"] inside a <label> element.
-      // The label's click handler is what actually selects the option and
-      // updates aria-checked. Clicking the radio div alone may be silently ignored.
-      const labelParent = target.closest('label') as HTMLElement | null
-      // Also check the [data-value] container (outer nWQGrd div in Google Forms)
-      const dataValueParent = target.closest('[data-value]') as HTMLElement | null
-
-      // Click in order: label → data-value container → the radio div itself
-      if (labelParent) {
-        clickOption(labelParent)
-      } else if (dataValueParent) {
-        clickOption(dataValueParent)
-      } else {
-        clickOption(target)
-      }
-
-      // Keyboard Space fallback — Google Forms and other ARIA radio implementations
-      // listen for Space/Enter keydown to toggle selection.
-      target.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, bubbles: true, cancelable: true }))
-      target.dispatchEvent(new KeyboardEvent('keyup',  { key: ' ', code: 'Space', keyCode: 32, bubbles: true }))
-
-      console.log(`[CS] ✓ ARIA radio "${getLabel(el)}": "${target.getAttribute('aria-label') ?? target.textContent?.trim()}"`)
+      clickAriaRadio(opts, target, getLabel(el))
       return true
     }
     console.warn(`[CS] ARIA radiogroup "${getLabel(el)}": no option matching "${value}"`)
