@@ -1,0 +1,55 @@
+export const DEMO_USER = {
+  firstName: "John",
+  lastName: "Doe",
+  fullName: "John Doe",
+  email: "john.doe@example.com",
+  phone: "+16502831234",
+  address: "123 Main Street",
+  city: "San Francisco",
+  state: "California",
+  country: "United States",
+  zipCode: "94105",
+  linkedin: "https://linkedin.com/in/johndoe",
+  github: "https://github.com/johndoe",
+  portfolio: "https://johndoe.dev",
+  currentCompany: "Tech Corp",
+  currentTitle: "Software Engineer",
+  yearsExperience: "5",
+  skills: "JavaScript, TypeScript, React, Node.js, Python",
+  salaryExpectation: "120000",
+  dateOfBirth: "1990-01-15",
+  noticePeriod: "2 weeks",
+  workAuthorized: "Yes",
+  requiresSponsorship: "No",
+  coverLetter:
+    "Dear Hiring Manager,\n\nI am excited to apply for this position. With 5 years of software engineering experience, I bring strong expertise in JavaScript, TypeScript, React, and Node.js.\n\nBest regards,\nJohn Doe",
+  educationHistory: [
+    {
+      school: "University of California, Berkeley",
+      degree: "Bachelor of Science",
+      fieldOfStudy: "Computer Science",
+      startYear: "2015",
+      endYear: "2019",
+      gpa: "3.8",
+    },
+  ],
+  workExperience: [
+    {
+      company: "Tech Corp",
+      title: "Software Engineer",
+      startDate: "07/2019",
+      endDate: "present",
+      description:
+        "Developed full-stack web applications using React, TypeScript, and Node.js. Led a team of 3 engineers and improved application performance by 40%.",
+    },
+    {
+      company: "StartupXYZ",
+      title: "Junior Developer",
+      startDate: "05/2018",
+      endDate: "06/2019",
+      description:
+        "Worked on front-end development with React and Redux. Implemented UI components and integrated REST APIs.",
+    },
+  ],
+  resumeFile: "[RESUME]",
+};
